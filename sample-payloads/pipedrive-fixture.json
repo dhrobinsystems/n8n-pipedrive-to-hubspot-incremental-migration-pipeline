@@ -1,0 +1,561 @@
+{
+  "_meta": {
+    "synthetic": true,
+    "description": "Fully synthetic Pipedrive data, HubSpot snapshot and migration-state seed. Fictitious companies and people, example.com addresses, placeholder ids. No real accounts or customer data.",
+    "pipedriveDomainFieldKey": "a1b2c3d4e5f6placeholderwebsitekey0000001",
+    "scenarios": {
+      "organizations": {
+        "9100001": "Mapped earlier with identical hash -> SKIP_UNCHANGED",
+        "9100002": "New -> CREATE (domain from custom field)",
+        "9100003": "Missing name -> QUARANTINE",
+        "9100004": "Exists in HubSpot (pipedrive_org_id), not in local map -> UPDATE",
+        "9100005": "Older than the watermark -> not extracted"
+      },
+      "persons": {
+        "9200001": "New contact -> CREATE, associated to mapped company",
+        "9200002": "New contact -> CREATE, associated to company created this run",
+        "9200003": "Email owned by a HubSpot contact created outside the migration -> QUARANTINE (CONTACT_EMAIL_CONFLICT)",
+        "9200004": "Same email as 9200001 -> QUARANTINE (DUPLICATE_EMAIL_IN_SOURCE)",
+        "9200005": "No name, no email -> QUARANTINE",
+        "9200006": "Invalid email -> CREATE without email (warning)",
+        "9200007": "Org 9100099 not in Pipedrive extract, map or HubSpot -> association PENDING",
+        "9200008": "Already in HubSpot by pipedrive_person_id -> UPDATE"
+      },
+      "deals": {
+        "9300001": "Open, stage mapped -> CREATE, associated to company + contact",
+        "9300002": "Won -> STAGE_MAP_JSON.won",
+        "9300003": "Unmapped stage 99 -> QUARANTINE",
+        "9300004": "Invalid amount -> CREATE without amount (warning)",
+        "9300005": "Contact is quarantined -> deal->contact association PENDING",
+        "9300006": "Deleted -> excluded by DEAL_STATUSES"
+      },
+      "activities": {
+        "9400001": "Completed call -> calls",
+        "9400002": "Planned call -> CALL task (HubSpot calls have no scheduled status)",
+        "9400003": "Meeting with 1 h duration -> meetings",
+        "9400004": "Custom type 'demo' -> task (warning)",
+        "9400005": "No due date -> add_time used (warning)",
+        "9400006": "No parent -> warning",
+        "9400007": "Deadline with HTML note -> task, HTML stripped"
+      },
+      "pending": "Contact 9200101 (migrated earlier) waited for company 9100002, which is created in this run -> association resolves"
+    }
+  },
+  "sandboxMapping": {
+    "ownerMap": {
+      "9900001": "88000001",
+      "9900002": "88000002"
+    },
+    "stageMap": {
+      "1": {
+        "pipeline": "default",
+        "dealstage": "appointmentscheduled"
+      },
+      "2": {
+        "pipeline": "default",
+        "dealstage": "qualifiedtobuy"
+      },
+      "3": {
+        "pipeline": "default",
+        "dealstage": "presentationscheduled"
+      },
+      "won": {
+        "pipeline": "default",
+        "dealstage": "closedwon"
+      },
+      "lost": {
+        "pipeline": "default",
+        "dealstage": "closedlost"
+      }
+    }
+  },
+  "pipedrive": {
+    "organizations": [
+      {
+        "id": 9100001,
+        "name": "Northwind Example Co",
+        "owner_id": 9900001,
+        "add_time": "2026-10-01T08:00:00Z",
+        "update_time": "2026-11-10T09:00:00Z",
+        "address": {
+          "value": "1 Example Way, Springfield",
+          "locality": "Springfield",
+          "country": "United States",
+          "postal_code": "00001",
+          "formatted_address": "1 Example Way, Springfield 00001, United States"
+        },
+        "custom_fields": {}
+      },
+      {
+        "id": 9100002,
+        "name": "Acme Example Holdings",
+        "owner_id": 9900001,
+        "add_time": "2026-10-01T08:00:00Z",
+        "update_time": "2026-11-12T10:00:00Z",
+        "address": null,
+        "custom_fields": {
+          "a1b2c3d4e5f6placeholderwebsitekey0000001": "https://www.acme-example.example.com/about"
+        }
+      },
+      {
+        "id": 9100003,
+        "name": "   ",
+        "owner_id": 9900001,
+        "add_time": "2026-10-01T08:00:00Z",
+        "update_time": "2026-11-12T11:00:00Z",
+        "address": null,
+        "custom_fields": {}
+      },
+      {
+        "id": 9100004,
+        "name": "Globex Example Ltd",
+        "owner_id": 9900003,
+        "add_time": "2026-10-01T08:00:00Z",
+        "update_time": "2026-11-13T12:00:00Z",
+        "address": null,
+        "custom_fields": {}
+      },
+      {
+        "id": 9100005,
+        "name": "Initech Example (old)",
+        "owner_id": 9900001,
+        "add_time": "2026-10-01T08:00:00Z",
+        "update_time": "2026-10-15T08:00:00Z",
+        "address": null,
+        "custom_fields": {}
+      }
+    ],
+    "persons": [
+      {
+        "id": 9200001,
+        "name": "Ada Example",
+        "first_name": "Ada",
+        "last_name": "Example",
+        "emails": [
+          {
+            "value": "ada@example.com",
+            "primary": true,
+            "label": "work"
+          }
+        ],
+        "phones": [
+          {
+            "value": "+1 555 010 0101",
+            "primary": true
+          }
+        ],
+        "org_id": 9100001,
+        "owner_id": 9900001,
+        "add_time": "2026-10-02T08:00:00Z",
+        "update_time": "2026-11-12T09:00:00Z"
+      },
+      {
+        "id": 9200002,
+        "name": "Ben Example",
+        "first_name": "Ben",
+        "last_name": "Example",
+        "emails": [
+          {
+            "value": "ben@example.com",
+            "primary": true,
+            "label": "work"
+          }
+        ],
+        "phones": [],
+        "org_id": 9100002,
+        "owner_id": 9900001,
+        "add_time": "2026-10-02T08:00:00Z",
+        "update_time": "2026-11-12T09:30:00Z"
+      },
+      {
+        "id": 9200003,
+        "name": "Carol Example",
+        "first_name": "Carol",
+        "last_name": "Example",
+        "emails": [
+          {
+            "value": "carol@example.com",
+            "primary": true,
+            "label": "work"
+          }
+        ],
+        "phones": [],
+        "org_id": 9100002,
+        "owner_id": 9900001,
+        "add_time": "2026-10-02T08:00:00Z",
+        "update_time": "2026-11-12T10:00:00Z"
+      },
+      {
+        "id": 9200004,
+        "name": "Ada Duplicate",
+        "first_name": "Ada",
+        "last_name": "Duplicate",
+        "emails": [
+          {
+            "value": "Ada@Example.com",
+            "primary": true,
+            "label": "work"
+          }
+        ],
+        "phones": [],
+        "org_id": 9100001,
+        "owner_id": 9900001,
+        "add_time": "2026-10-02T08:00:00Z",
+        "update_time": "2026-11-12T10:30:00Z"
+      },
+      {
+        "id": 9200005,
+        "name": "",
+        "first_name": "",
+        "last_name": "",
+        "emails": [],
+        "phones": [],
+        "org_id": null,
+        "owner_id": 9900001,
+        "add_time": "2026-10-02T08:00:00Z",
+        "update_time": "2026-11-12T11:00:00Z"
+      },
+      {
+        "id": 9200006,
+        "name": "Dan Example",
+        "first_name": "Dan",
+        "last_name": "Example",
+        "emails": [
+          {
+            "value": "dan(at)example.com",
+            "primary": true,
+            "label": "work"
+          }
+        ],
+        "phones": [],
+        "org_id": 9100004,
+        "owner_id": 9900001,
+        "add_time": "2026-10-02T08:00:00Z",
+        "update_time": "2026-11-12T11:30:00Z"
+      },
+      {
+        "id": 9200007,
+        "name": "Eve Example",
+        "first_name": "Eve",
+        "last_name": "Example",
+        "emails": [
+          {
+            "value": "eve@example.com",
+            "primary": true,
+            "label": "work"
+          }
+        ],
+        "phones": [],
+        "org_id": 9100099,
+        "owner_id": 9900001,
+        "add_time": "2026-10-02T08:00:00Z",
+        "update_time": "2026-11-12T12:00:00Z"
+      },
+      {
+        "id": 9200008,
+        "name": "Erin Example",
+        "first_name": "Erin",
+        "last_name": "Example",
+        "emails": [
+          {
+            "value": "erin@example.com",
+            "primary": true,
+            "label": "work"
+          }
+        ],
+        "phones": [],
+        "org_id": 9100004,
+        "owner_id": 9900001,
+        "add_time": "2026-10-02T08:00:00Z",
+        "update_time": "2026-11-13T08:00:00Z"
+      }
+    ],
+    "deals": [
+      {
+        "id": 9300001,
+        "title": "Northwind Example - Platform rollout",
+        "status": "open",
+        "stage_id": 1,
+        "pipeline_id": 1,
+        "value": 12500,
+        "currency": "USD",
+        "org_id": 9100001,
+        "person_id": 9200001,
+        "owner_id": 9900001,
+        "add_time": "2026-10-03T08:00:00Z",
+        "update_time": "2026-11-12T13:00:00Z",
+        "expected_close_date": "2026-12-15"
+      },
+      {
+        "id": 9300002,
+        "title": "Acme Example - Annual plan",
+        "status": "won",
+        "stage_id": 3,
+        "pipeline_id": 1,
+        "value": "48000.50",
+        "currency": "USD",
+        "org_id": 9100002,
+        "person_id": 9200002,
+        "owner_id": 9900001,
+        "add_time": "2026-10-03T08:00:00Z",
+        "update_time": "2026-11-12T14:00:00Z",
+        "won_time": "2026-11-11T16:00:00Z"
+      },
+      {
+        "id": 9300003,
+        "title": "Globex Example - Pilot",
+        "status": "open",
+        "stage_id": 99,
+        "pipeline_id": 1,
+        "value": 5000,
+        "currency": "USD",
+        "org_id": 9100004,
+        "person_id": null,
+        "owner_id": 9900001,
+        "add_time": "2026-10-03T08:00:00Z",
+        "update_time": "2026-11-12T15:00:00Z"
+      },
+      {
+        "id": 9300004,
+        "title": "Globex Example - Expansion",
+        "status": "open",
+        "stage_id": 2,
+        "pipeline_id": 1,
+        "value": "abc",
+        "currency": "USD",
+        "org_id": 9100004,
+        "person_id": 9200008,
+        "owner_id": 9900001,
+        "add_time": "2026-10-03T08:00:00Z",
+        "update_time": "2026-11-13T09:00:00Z"
+      },
+      {
+        "id": 9300005,
+        "title": "Acme Example - Services",
+        "status": "open",
+        "stage_id": 2,
+        "pipeline_id": 1,
+        "value": 3000,
+        "currency": "USD",
+        "org_id": 9100002,
+        "person_id": 9200003,
+        "owner_id": 9900001,
+        "add_time": "2026-10-03T08:00:00Z",
+        "update_time": "2026-11-13T10:00:00Z"
+      },
+      {
+        "id": 9300006,
+        "title": "Removed Example deal",
+        "status": "deleted",
+        "stage_id": 1,
+        "pipeline_id": 1,
+        "value": 100,
+        "currency": "USD",
+        "org_id": null,
+        "person_id": null,
+        "owner_id": 9900001,
+        "add_time": "2026-10-03T08:00:00Z",
+        "update_time": "2026-11-13T11:00:00Z"
+      }
+    ],
+    "activities": [
+      {
+        "id": 9400001,
+        "type": "call",
+        "subject": "Discovery call",
+        "done": true,
+        "due_date": "2026-11-12",
+        "due_time": "15:00",
+        "duration": "00:25",
+        "deal_id": 9300001,
+        "person_id": 9200001,
+        "org_id": 9100001,
+        "note": "Discussed rollout scope.",
+        "owner_id": 9900002,
+        "add_time": "2026-11-05T08:00:00Z",
+        "update_time": "2026-11-13T12:00:00Z"
+      },
+      {
+        "id": 9400002,
+        "type": "call",
+        "subject": "Follow-up call",
+        "done": false,
+        "due_date": "2026-11-20",
+        "due_time": "10:00",
+        "duration": null,
+        "deal_id": 9300001,
+        "person_id": 9200001,
+        "org_id": null,
+        "note": null,
+        "owner_id": 9900002,
+        "add_time": "2026-11-05T08:00:00Z",
+        "update_time": "2026-11-13T12:05:00Z"
+      },
+      {
+        "id": 9400003,
+        "type": "meeting",
+        "subject": "Kick-off meeting",
+        "done": true,
+        "due_date": "2026-11-12",
+        "due_time": "09:00",
+        "duration": "01:00",
+        "deal_id": 9300002,
+        "person_id": 9200002,
+        "org_id": 9100002,
+        "note": null,
+        "owner_id": 9900002,
+        "add_time": "2026-11-05T08:00:00Z",
+        "update_time": "2026-11-13T12:10:00Z"
+      },
+      {
+        "id": 9400004,
+        "type": "demo",
+        "subject": "Product demo",
+        "done": false,
+        "due_date": "2026-11-18",
+        "due_time": "14:00",
+        "duration": null,
+        "deal_id": 9300004,
+        "person_id": null,
+        "org_id": null,
+        "note": null,
+        "owner_id": 9900002,
+        "add_time": "2026-11-05T08:00:00Z",
+        "update_time": "2026-11-13T12:15:00Z"
+      },
+      {
+        "id": 9400005,
+        "type": "task",
+        "subject": "Send proposal",
+        "done": false,
+        "due_date": null,
+        "due_time": null,
+        "duration": null,
+        "deal_id": 9300002,
+        "person_id": null,
+        "org_id": null,
+        "note": null,
+        "owner_id": 9900002,
+        "add_time": "2026-11-05T08:00:00Z",
+        "update_time": "2026-11-13T12:20:00Z"
+      },
+      {
+        "id": 9400006,
+        "type": "task",
+        "subject": "Update CRM notes",
+        "done": false,
+        "due_date": "2026-11-14",
+        "due_time": null,
+        "duration": null,
+        "deal_id": null,
+        "person_id": null,
+        "org_id": null,
+        "note": null,
+        "owner_id": 9900002,
+        "add_time": "2026-11-05T08:00:00Z",
+        "update_time": "2026-11-13T12:25:00Z"
+      },
+      {
+        "id": 9400007,
+        "type": "deadline",
+        "subject": "Contract deadline",
+        "done": false,
+        "due_date": "2026-11-30",
+        "due_time": null,
+        "duration": null,
+        "deal_id": 9300005,
+        "person_id": null,
+        "org_id": null,
+        "note": "<p>Legal review&nbsp;<b>required</b></p>",
+        "owner_id": 9900002,
+        "add_time": "2026-11-05T08:00:00Z",
+        "update_time": "2026-11-13T12:30:00Z"
+      }
+    ]
+  },
+  "hubspotExisting": {
+    "companies": [
+      {
+        "id": "71000001",
+        "properties": {
+          "pipedrive_org_id": "9100001",
+          "name": "Northwind Example Co"
+        }
+      },
+      {
+        "id": "71000004",
+        "properties": {
+          "pipedrive_org_id": "9100004",
+          "name": "Globex Example Ltd"
+        }
+      }
+    ],
+    "contacts": [
+      {
+        "id": "72000003",
+        "properties": {
+          "email": "carol@example.com",
+          "pipedrive_person_id": null
+        }
+      },
+      {
+        "id": "72000008",
+        "properties": {
+          "email": "erin@example.com",
+          "pipedrive_person_id": "9200008"
+        }
+      },
+      {
+        "id": "72000101",
+        "properties": {
+          "email": "frank@example.com",
+          "pipedrive_person_id": "9200101"
+        }
+      }
+    ],
+    "deals": [],
+    "calls": [],
+    "meetings": [],
+    "tasks": []
+  },
+  "stateSeed": {
+    "version": 1,
+    "watermarks": {
+      "organizations": "2026-11-01T00:00:00Z",
+      "persons": "2026-11-01T00:00:00Z",
+      "deals": "2026-11-01T00:00:00Z",
+      "activities": "2026-11-01T00:00:00Z"
+    },
+    "maps": {
+      "organizations": {
+        "9100001": {
+          "id": "71000001",
+          "h": "a58d95e4"
+        }
+      },
+      "persons": {
+        "9200101": {
+          "id": "72000101",
+          "h": "0f0f0f0f"
+        }
+      },
+      "deals": {},
+      "activities": {}
+    },
+    "pending": [
+      {
+        "fromEntity": "persons",
+        "fromType": "contacts",
+        "fromPd": "9200101",
+        "toEntity": "organizations",
+        "toType": "companies",
+        "toPd": "9100002",
+        "reason": "TARGET_NOT_IN_HUBSPOT",
+        "since": "2026-11-10T00:00:00.000Z"
+      }
+    ],
+    "quarantine": {},
+    "runs": [],
+    "updatedAt": "2026-11-10T00:00:00.000Z"
+  }
+}

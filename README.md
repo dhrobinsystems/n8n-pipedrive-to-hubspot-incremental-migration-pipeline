@@ -55,6 +55,8 @@ Pipedrive v2 (updated_since watermark, cursor pages)
 
 ## Architecture
 
+![n8n Pipedrive to HubSpot Incremental Migration Pipeline Overview](https://raw.githubusercontent.com/dhrobinsystems/n8n-pipedrive-to-hubspot-incremental-migration-pipeline/main/workflow-overview.png)
+
 ```mermaid
 flowchart TD
     T1[Manual Test Trigger] --> CFG

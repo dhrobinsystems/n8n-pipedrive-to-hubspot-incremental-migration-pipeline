@@ -1,0 +1,56 @@
+# =============================================================================
+# n8n-pipedrive-to-hubspot-incremental-migration-pipeline :: .gitignore
+# Full text: DISCLAIMER.md · Licensed under the MIT License. License: MIT © 2026 dhRobin Systems · Provided as-is, see the disclaimer.
+# =============================================================================
+
+# --- Secrets & local environment ----------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+credentials*.json
+
+# --- Local n8n data, SQLite and other databases ---------------------------------
+.n8n/
+n8n-data/
+*.sqlite
+*.sqlite3
+*.sqlite-shm
+*.sqlite-wal
+*.db
+*.db-journal
+
+# --- Simulator and sandbox outputs ----------------------------------------------
+sim-output/
+sandbox-output/
+tmp/
+temp/
+*.tmp
+
+# --- Migration exports (may contain CRM data or ID mapping tables) ---------------
+exports/
+reports/
+mapping-exports/
+*.csv
+*.xlsx
+validation-report*.json
+migration-state*.json
+
+# --- Logs ----------------------------------------------------------------------------
+*.log
+logs/
+npm-debug.log*
+
+# --- Node / tooling ----------------------------------------------------------------
+node_modules/
+.npm/
+coverage/
+
+# --- OS / editor ---------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

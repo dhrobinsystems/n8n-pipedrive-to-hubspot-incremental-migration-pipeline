@@ -1,0 +1,1274 @@
+{
+  "name": "Pipedrive → HubSpot Incremental Migration Pipeline (Safe-by-Default)",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Pipedrive → HubSpot Incremental Migration Pipeline\n\n**Safe by default.** With no env vars this runs in **SANDBOX_MODE** on a synthetic Pipedrive fixture: zero network calls, nothing written, static data untouched. The validation report is in **Dry-Run Validation Report**.\n\nGo-live is staged: `SANDBOX_MODE=false` (read-only extract + read-only HubSpot preflight, still DRY_RUN) → `DRY_RUN=false` + `HUBSPOT_WRITES_ENABLED=true` (idempotent batch upserts keyed by `pipedrive_*_id`).\n\nOrder: organizations → persons → deals → activities, then associations from Pipedrive foreign keys via the ID mapping tables. Fail closed on malformed pages, failed lookups, corrupt state and guard breaches. Tokens only via `$env`. See README.md.\n\nFull text: DISCLAIMER.md · Licensed under the MIT License. License: MIT © 2026 dhRobin Systems · Provided as-is, see the disclaimer.",
+        "height": 440,
+        "width": 620,
+        "color": 4
+      },
+      "id": "0473cc05-5c8e-4f6f-a478-a222698a794f",
+      "name": "Safety Notes",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -560,
+        -600
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "2eafb56f-911a-41b4-a007-d7dc3af664e0",
+      "name": "Manual Test Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -520,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "17 * * * *"
+            }
+          ]
+        }
+      },
+      "id": "cf9a31d4-8931-488d-af25-bcf52162bc52",
+      "name": "Incremental Sync (hourly :17)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -520,
+        200
+      ],
+      "notes": "Hourly incremental run at minute 17 (instance time zone). Ships inactive."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Full text: DISCLAIMER.md · Licensed under the MIT License. License: MIT © 2026 dhRobin Systems · Provided as-is, see the disclaimer.\n// ============================================================================\n// Config & Safety Gate\n// Env-only configuration for the Pipedrive -> HubSpot incremental migration.\n//   * Safe-ON  flags (SANDBOX_MODE, DRY_RUN, ASSOCIATIONS_ENABLED) turn OFF\n//     only on false/0/no/off.\n//   * Safe-OFF flags (HUBSPOT_WRITES_ENABLED, FULL_RESYNC, STATE_RESET) turn ON\n//     only on true/1/yes/on. Typos keep the safe value. Blocked $env => sandbox.\n// API tokens never leave this node: only \"is set\" booleans do. The HTTP nodes\n// read the tokens from $env in their headers.\n// ============================================================================\nconst TRUTHY = ['true', '1', 'yes', 'on'];\nconst FALSY = ['false', '0', 'no', 'off'];\nlet envBlocked = false;\nfunction readEnv(key) {\n  try {\n    const v = $env[key];\n    return v === undefined || v === null ? '' : String(v).trim();\n  } catch (e) {\n    envBlocked = true;\n    return '';\n  }\n}\nconst str = (k, d = '') => readEnv(k) || d;\nconst safeOn = (k) => !FALSY.includes(readEnv(k).toLowerCase());\nconst safeOff = (k) => TRUTHY.includes(readEnv(k).toLowerCase());\nconst list = (k, d = '') => (readEnv(k) || d).split(',').map((s) => s.trim()).filter(Boolean);\nconst configErrors = [];\nconst warnings = [];\nconst intIn = (k, d, min, max) => {\n  const raw = readEnv(k);\n  if (raw === '') return d;\n  const n = Number(raw);\n  if (!/^-?\\d+$/.test(raw) || n < min || n > max) { configErrors.push(`${k} must be an integer ${min}-${max} (got \"${raw}\")`); return d; }\n  return n;\n};\nfunction jsonEnv(k, fallback) {\n  const raw = readEnv(k);\n  if (!raw) return fallback;\n  if (raw.length > 200000) { configErrors.push(`${k} is larger than 200 KB`); return fallback; }\n  try {\n    const v = JSON.parse(raw);\n    if (!v || typeof v !== 'object' || Array.isArray(v)) { configErrors.push(`${k} must be a JSON object`); return fallback; }\n    return v;\n  } catch (e) { configErrors.push(`${k} is not valid JSON: ${e.message}`); return fallback; }\n}\nconst ID_RE = /^\\d{1,18}$/;\nconst PROP_RE = /^[a-z][a-z0-9_]{0,99}$/;\n\n// ---- Flags --------------------------------------------------------------------\nconst sandboxMode = safeOn('SANDBOX_MODE');\nconst dryRun = safeOn('DRY_RUN');\nconst writesEnabled = safeOff('HUBSPOT_WRITES_ENABLED');\nconst associationsEnabled = safeOn('ASSOCIATIONS_ENABLED');\nconst fullResync = safeOff('FULL_RESYNC');\nconst stateReset = safeOff('STATE_RESET');\nconst hasPipedriveToken = readEnv('PIPEDRIVE_API_TOKEN') !== '';\nconst hasHubspotToken = readEnv('HUBSPOT_PRIVATE_APP_TOKEN') !== '';\nif (!sandboxMode) {\n  const p = [];\n  if (!hasPipedriveToken) p.push('PIPEDRIVE_API_TOKEN is not set');\n  if (!hasHubspotToken) p.push('HUBSPOT_PRIVATE_APP_TOKEN is not set (also needed for the read-only preflight lookup)');\n  if (p.length) throw new Error('Live mode (SANDBOX_MODE=false) refused: ' + p.join('; ') + '. Set the tokens or keep SANDBOX_MODE=true.');\n}\n\nconst nowMs = (() => { const o = str('NOW_OVERRIDE'); return o && !Number.isNaN(Date.parse(o)) ? Date.parse(o) : Date.now(); })();\n\n// ---- Endpoints (hosts allowlisted, no paths / credentials in base URLs) -------\nfunction checkBase(key, def, allowKey, allowDef) {\n  const v = str(key, def).replace(/\\/+$/, '');\n  const allowed = list(allowKey, allowDef).map((h) => h.toLowerCase());\n  const m = v.match(/^(https?):\\/\\/([a-z0-9.-]+)(?::(\\d{1,5}))?$/i);\n  if (!m) { configErrors.push(`${key} must be scheme://host[:port] with no path or credentials`); return null; }\n  const host = m[2].toLowerCase();\n  const ok = allowed.some((s) => (s.startsWith('.') ? host.endsWith(s) : host === s));\n  if (!ok) { configErrors.push(`${key} host ${host} is not in ${allowKey}`); return null; }\n  if (m[1].toLowerCase() !== 'https' && !/^(127\\.0\\.0\\.1|localhost)$/.test(host)) { configErrors.push(`${key} must use https`); return null; }\n  return v;\n}\nconst pipedriveBase = checkBase('PIPEDRIVE_API_BASE_URL', 'https://api.pipedrive.com', 'PIPEDRIVE_ALLOWED_HOSTS', 'api.pipedrive.com,.pipedrive.com');\nconst hubspotBase = checkBase('HUBSPOT_API_BASE_URL', 'https://api.hubapi.com', 'HUBSPOT_ALLOWED_HOSTS', 'api.hubapi.com,api-eu1.hubapi.com');\n\n// ---- Migration scope ------------------------------------------------------------\nconst ALL = ['organizations', 'persons', 'deals', 'activities'];\nconst entities = list('ENTITIES', ALL.join(',')).map((e) => e.toLowerCase());\nfor (const e of entities) if (!ALL.includes(e)) configErrors.push(`ENTITIES: unknown entity \"${e}\" (use ${ALL.join(', ')})`);\nconst startRaw = str('MIGRATION_START_DATE', '2000-01-01T00:00:00Z');\nif (!/^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$/.test(startRaw) || Number.isNaN(Date.parse(startRaw))) configErrors.push('MIGRATION_START_DATE must be RFC3339 UTC, e.g. 2024-01-01T00:00:00Z');\nconst dealStatuses = list('DEAL_STATUSES', 'open,won,lost').filter((s) => ['open', 'won', 'lost'].includes(s));\nif (!dealStatuses.length) configErrors.push('DEAL_STATUSES must list open, won and/or lost');\n\n// ---- HubSpot object model ----------------------------------------------------------\nconst idProps = {\n  organizations: (readEnv('HS_ORG_ID_PROPERTY') || 'pipedrive_org_id'),\n  persons: (readEnv('HS_PERSON_ID_PROPERTY') || 'pipedrive_person_id'),\n  deals: (readEnv('HS_DEAL_ID_PROPERTY') || 'pipedrive_deal_id'),\n  activities: (readEnv('HS_ACTIVITY_ID_PROPERTY') || 'pipedrive_activity_id'),\n};\nfor (const [k, v] of Object.entries(idProps)) if (!PROP_RE.test(v)) configErrors.push(`ID property for ${k} must be a lowercase HubSpot internal name (got \"${v}\")`);\n\n// ---- Mapping tables supplied by the operator --------------------------------------\nconst ownerMapRaw = jsonEnv('OWNER_MAP_JSON', {});\nconst ownerMap = {};\nfor (const [k, v] of Object.entries(ownerMapRaw)) { if (ID_RE.test(k) && ID_RE.test(String(v))) ownerMap[k] = String(v); else configErrors.push(`OWNER_MAP_JSON entry \"${String(k).slice(0, 30)}\" must map a Pipedrive user id to a HubSpot owner id`); }\nconst stageMapRaw = jsonEnv('STAGE_MAP_JSON', {});\nconst stageMap = {};\nfor (const [k, v] of Object.entries(stageMapRaw)) {\n  if (!(ID_RE.test(k) || ['won', 'lost'].includes(k))) { configErrors.push(`STAGE_MAP_JSON key \"${String(k).slice(0, 30)}\" must be a Pipedrive stage id, \"won\" or \"lost\"`); continue; }\n  if (!v || typeof v.pipeline !== 'string' || typeof v.dealstage !== 'string' || !v.pipeline || !v.dealstage || v.pipeline.length > 100 || v.dealstage.length > 100) { configErrors.push(`STAGE_MAP_JSON.${k} needs {\"pipeline\":\"…\",\"dealstage\":\"…\"}`); continue; }\n  stageMap[k] = { pipeline: v.pipeline, dealstage: v.dealstage };\n}\nconst defaultStage = readEnv('DEFAULT_DEAL_PIPELINE') && readEnv('DEFAULT_DEAL_STAGE') ? { pipeline: readEnv('DEFAULT_DEAL_PIPELINE'), dealstage: readEnv('DEFAULT_DEAL_STAGE') } : null;\nconst DEFAULT_ACTIVITY_TYPES = { call: 'calls', meeting: 'meetings', lunch: 'meetings', task: 'tasks', deadline: 'tasks', email: 'tasks' };\nconst activityTypeMap = { ...DEFAULT_ACTIVITY_TYPES };\nfor (const [k, v] of Object.entries(jsonEnv('ACTIVITY_TYPE_MAP_JSON', {}))) { if (['calls', 'meetings', 'tasks'].includes(v) && /^[a-z0-9_]{1,40}$/.test(k)) activityTypeMap[k] = v; else configErrors.push(`ACTIVITY_TYPE_MAP_JSON.${String(k).slice(0, 30)} must be calls, meetings or tasks`); }\nconst emailConflictPolicy = str('CONTACT_EMAIL_CONFLICT_POLICY', 'quarantine').toLowerCase();\nif (!['quarantine', 'strip_email', 'adopt'].includes(emailConflictPolicy)) configErrors.push('CONTACT_EMAIL_CONFLICT_POLICY must be quarantine, strip_email or adopt');\nconst orgDomainField = readEnv('PIPEDRIVE_ORG_DOMAIN_FIELD');\nif (orgDomainField && !/^[a-z0-9_]{1,64}$/i.test(orgDomainField)) configErrors.push('PIPEDRIVE_ORG_DOMAIN_FIELD must be a Pipedrive custom field key');\n\n// ---- Batching and guards -------------------------------------------------------------\nconst pipedrivePageSize = intIn('PIPEDRIVE_PAGE_SIZE', 500, 1, 500);\nconst pipedriveMaxPages = intIn('PIPEDRIVE_MAX_PAGES_PER_ENTITY', 20, 1, 1000);\nconst batchSize = intIn('BATCH_SIZE', 100, 1, 100);\nconst assocBatchSize = intIn('ASSOCIATION_BATCH_SIZE', 100, 1, 1000);\nconst guards = {\n  maxWritesPerRun: intIn('MAX_WRITES_PER_RUN', 5000, 1, 1000000),\n  maxQuarantinePct: intIn('MAX_QUARANTINE_PCT', 25, 0, 100),\n  maxPendingAssociations: intIn('MAX_PENDING_ASSOCIATIONS', 10000, 0, 1000000),\n};\n\nconst writeBlockers = [];\nif (sandboxMode) writeBlockers.push('SANDBOX_MODE=true (synthetic fixture, nothing is written)');\nif (dryRun) writeBlockers.push('DRY_RUN=true (validation report only)');\nif (!writesEnabled) writeBlockers.push('HUBSPOT_WRITES_ENABLED is not true');\nif (envBlocked) writeBlockers.push('n8n blocked $env access');\nif (configErrors.length) writeBlockers.push(`${configErrors.length} configuration error(s)`);\nif (!Object.keys(stageMap).length && !defaultStage && entities.includes('deals')) warnings.push('STAGE_MAP_JSON is empty and no DEFAULT_DEAL_STAGE is set: every deal will be quarantined (DEAL_UNMAPPED_STAGE). This is intentional fail-closed behaviour.');\n\nconst config = {\n  runId: 'mig-' + new Date(nowMs).toISOString().replace(/[-:.TZ]/g, '').slice(0, 14) + '-' + Math.random().toString(36).slice(2, 8),\n  now: new Date(nowMs).toISOString(),\n  nowMs,\n  envBlocked,\n  sandboxMode,\n  dryRun,\n  fullResync,\n  stateReset,\n  entities: ALL.filter((e) => entities.includes(e)),\n  startDate: startRaw,\n  pipedrive: { base: pipedriveBase, pageSize: pipedrivePageSize, maxPages: pipedriveMaxPages, dealStatuses, orgDomainField: orgDomainField || null, tokenSet: hasPipedriveToken },\n  hubspot: {\n    base: hubspotBase,\n    tokenSet: hasHubspotToken,\n    batchSize,\n    assocBatchSize,\n    idProps,\n    objectTypes: { organizations: 'companies', persons: 'contacts', deals: 'deals' },\n    mapDealCurrency: safeOff('MAP_DEAL_CURRENCY'),\n    appBase: str('HUBSPOT_APP_BASE_URL', 'https://app.hubspot.com').replace(/\\/+$/, ''),\n  },\n  mapping: { ownerMap, stageMap, defaultStage, activityTypeMap, emailConflictPolicy },\n  guards,\n  writes: { enabled: writesEnabled, associationsEnabled, allowedByConfig: writeBlockers.length === 0, blockers: writeBlockers },\n  configErrors,\n  warnings,\n};\nconst safetyDecisions = [\n  `Mode: ${sandboxMode ? 'SANDBOX (synthetic fixture, zero network calls)' : dryRun ? 'LIVE DRY-RUN (read-only Pipedrive extract + read-only HubSpot preflight)' : 'LIVE'}`,\n  `HubSpot writes: ${config.writes.allowedByConfig ? 'ARMED' : 'BLOCKED (' + writeBlockers.join('; ') + ')'}`,\n  `Entities: ${config.entities.join(' -> ')}${fullResync ? ' (FULL_RESYNC: watermarks and hashes ignored)' : ''}`,\n  `Batch size ${batchSize}; max ${guards.maxWritesPerRun} writes per run; max ${guards.maxQuarantinePct}% quarantined`,\n];\nreturn [{ json: { config, safetyDecisions } }];\n"
+      },
+      "id": "0453e350-73cd-46d8-aad5-98b8a228fe9c",
+      "name": "Config & Safety Gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -280,
+        100
+      ],
+      "notes": "Env-only config, fail-safe flags, host allowlists, owner / stage / activity mapping, guards."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "afa49d9b-55e5-40e5-a4a0-f2bc852069ff",
+              "leftValue": "={{ $('Config & Safety Gate').first().json.config.sandboxMode }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "029dce82-bcf4-4d5f-abab-6c45028db4d3",
+      "name": "Sandbox Mode?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        -60,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Full text: DISCLAIMER.md · Licensed under the MIT License. License: MIT © 2026 dhRobin Systems · Provided as-is, see the disclaimer.\n// ============================================================================\n// Load Synthetic Pipedrive Fixture  (SANDBOX_MODE only; zero network calls)\n// Fictitious organizations, persons, deals and activities plus a synthetic\n// \"already in HubSpot\" snapshot and a migration-state seed. Applies the same\n// incremental watermark filter as the live extract.\n// ============================================================================\nconst { config } = $('Config & Safety Gate').first().json;\n// ---- migration state helpers (shared by the state loaders) ------------------\nconst ENTITIES_ALL = ['organizations', 'persons', 'deals', 'activities'];\nfunction freshState() {\n  return {\n    version: 1,\n    watermarks: { organizations: null, persons: null, deals: null, activities: null },\n    maps: { organizations: {}, persons: {}, deals: {}, activities: {} },\n    pending: [],\n    quarantine: {},\n    runs: [],\n    updatedAt: null,\n  };\n}\nfunction validateState(s) {\n  const e = [];\n  if (!s || typeof s !== 'object' || Array.isArray(s)) return ['state is not an object'];\n  if (s.version !== 1) e.push(`unsupported state version ${JSON.stringify(s.version)}`);\n  for (const k of ENTITIES_ALL) {\n    const w = s.watermarks && s.watermarks[k];\n    if (w !== null && w !== undefined && (typeof w !== 'string' || Number.isNaN(Date.parse(w)))) e.push(`watermarks.${k} is not a timestamp`);\n    const m = s.maps && s.maps[k];\n    if (!m || typeof m !== 'object' || Array.isArray(m)) { e.push(`maps.${k} missing`); continue; }\n    for (const [pd, v] of Object.entries(m)) {\n      if (!/^\\d{1,18}$/.test(pd) || !v || !/^\\d{1,20}$/.test(String(v.id)) || typeof v.h !== 'string') { e.push(`maps.${k}.${pd.slice(0, 20)} is invalid`); break; }\n    }\n  }\n  if (!Array.isArray(s.pending) || !s.quarantine || typeof s.quarantine !== 'object' || !Array.isArray(s.runs)) e.push('pending / quarantine / runs missing');\n  return e;\n}\nfunction loadState(raw, reset) {\n  if (raw === undefined || raw === null) return { state: freshState(), source: 'new', errors: [] };\n  const errors = validateState(raw);\n  if (!errors.length) return { state: JSON.parse(JSON.stringify(raw)), source: 'persisted', errors };\n  if (reset) return { state: freshState(), source: 'reset', errors };\n  throw new Error('Migration state failed validation (fail closed, nothing extracted or written): ' + errors.slice(0, 3).join('; ') + '. Inspect workflow static data or set STATE_RESET=true once to rebuild (idempotent upserts make a rebuild safe).');\n}\n\nconst FIXTURE = {\n  \"_meta\": {\n    \"synthetic\": true,\n    \"description\": \"Fully synthetic Pipedrive data, HubSpot snapshot and migration-state seed. Fictitious companies and people, example.com addresses, placeholder ids. No real accounts or customer data.\",\n    \"pipedriveDomainFieldKey\": \"a1b2c3d4e5f6placeholderwebsitekey0000001\",\n    \"scenarios\": {\n      \"organizations\": {\n        \"9100001\": \"Mapped earlier with identical hash -> SKIP_UNCHANGED\",\n        \"9100002\": \"New -> CREATE (domain from custom field)\",\n        \"9100003\": \"Missing name -> QUARANTINE\",\n        \"9100004\": \"Exists in HubSpot (pipedrive_org_id), not in local map -> UPDATE\",\n        \"9100005\": \"Older than the watermark -> not extracted\"\n      },\n      \"persons\": {\n        \"9200001\": \"New contact -> CREATE, associated to mapped company\",\n        \"9200002\": \"New contact -> CREATE, associated to company created this run\",\n        \"9200003\": \"Email owned by a HubSpot contact created outside the migration -> QUARANTINE (CONTACT_EMAIL_CONFLICT)\",\n        \"9200004\": \"Same email as 9200001 -> QUARANTINE (DUPLICATE_EMAIL_IN_SOURCE)\",\n        \"9200005\": \"No name, no email -> QUARANTINE\",\n        \"9200006\": \"Invalid email -> CREATE without email (warning)\",\n        \"9200007\": \"Org 9100099 not in Pipedrive extract, map or HubSpot -> association PENDING\",\n        \"9200008\": \"Already in HubSpot by pipedrive_person_id -> UPDATE\"\n      },\n      \"deals\": {\n        \"9300001\": \"Open, stage mapped -> CREATE, associated to company + contact\",\n        \"9300002\": \"Won -> STAGE_MAP_JSON.won\",\n        \"9300003\": \"Unmapped stage 99 -> QUARANTINE\",\n        \"9300004\": \"Invalid amount -> CREATE without amount (warning)\",\n        \"9300005\": \"Contact is quarantined -> deal->contact association PENDING\",\n        \"9300006\": \"Deleted -> excluded by DEAL_STATUSES\"\n      },\n      \"activities\": {\n        \"9400001\": \"Completed call -> calls\",\n        \"9400002\": \"Planned call -> CALL task (HubSpot calls have no scheduled status)\",\n        \"9400003\": \"Meeting with 1 h duration -> meetings\",\n        \"9400004\": \"Custom type 'demo' -> task (warning)\",\n        \"9400005\": \"No due date -> add_time used (warning)\",\n        \"9400006\": \"No parent -> warning\",\n        \"9400007\": \"Deadline with HTML note -> task, HTML stripped\"\n      },\n      \"pending\": \"Contact 9200101 (migrated earlier) waited for company 9100002, which is created in this run -> association resolves\"\n    }\n  },\n  \"sandboxMapping\": {\n    \"ownerMap\": {\n      \"9900001\": \"88000001\",\n      \"9900002\": \"88000002\"\n    },\n    \"stageMap\": {\n      \"1\": {\n        \"pipeline\": \"default\",\n        \"dealstage\": \"appointmentscheduled\"\n      },\n      \"2\": {\n        \"pipeline\": \"default\",\n        \"dealstage\": \"qualifiedtobuy\"\n      },\n      \"3\": {\n        \"pipeline\": \"default\",\n        \"dealstage\": \"presentationscheduled\"\n      },\n      \"won\": {\n        \"pipeline\": \"default\",\n        \"dealstage\": \"closedwon\"\n      },\n      \"lost\": {\n        \"pipeline\": \"default\",\n        \"dealstage\": \"closedlost\"\n      }\n    }\n  },\n  \"pipedrive\": {\n    \"organizations\": [\n      {\n        \"id\": 9100001,\n        \"name\": \"Northwind Example Co\",\n        \"owner_id\": 9900001,\n        \"add_time\": \"2026-10-01T08:00:00Z\",\n        \"update_time\": \"2026-11-10T09:00:00Z\",\n        \"address\": {\n          \"value\": \"1 Example Way, Springfield\",\n          \"locality\": \"Springfield\",\n          \"country\": \"United States\",\n          \"postal_code\": \"00001\",\n          \"formatted_address\": \"1 Example Way, Springfield 00001, United States\"\n        },\n        \"custom_fields\": {}\n      },\n      {\n        \"id\": 9100002,\n        \"name\": \"Acme Example Holdings\",\n        \"owner_id\": 9900001,\n        \"add_time\": \"2026-10-01T08:00:00Z\",\n        \"update_time\": \"2026-11-12T10:00:00Z\",\n        \"address\": null,\n        \"custom_fields\": {\n          \"a1b2c3d4e5f6placeholderwebsitekey0000001\": \"https://www.acme-example.example.com/about\"\n        }\n      },\n      {\n        \"id\": 9100003,\n        \"name\": \"   \",\n        \"owner_id\": 9900001,\n        \"add_time\": \"2026-10-01T08:00:00Z\",\n        \"update_time\": \"2026-11-12T11:00:00Z\",\n        \"address\": null,\n        \"custom_fields\": {}\n      },\n      {\n        \"id\": 9100004,\n        \"name\": \"Globex Example Ltd\",\n        \"owner_id\": 9900003,\n        \"add_time\": \"2026-10-01T08:00:00Z\",\n        \"update_time\": \"2026-11-13T12:00:00Z\",\n        \"address\": null,\n        \"custom_fields\": {}\n      },\n      {\n        \"id\": 9100005,\n        \"name\": \"Initech Example (old)\",\n        \"owner_id\": 9900001,\n        \"add_time\": \"2026-10-01T08:00:00Z\",\n        \"update_time\": \"2026-10-15T08:00:00Z\",\n        \"address\": null,\n        \"custom_fields\": {}\n      }\n    ],\n    \"persons\": [\n      {\n        \"id\": 9200001,\n        \"name\": \"Ada Example\",\n        \"first_name\": \"Ada\",\n        \"last_name\": \"Example\",\n        \"emails\": [\n          {\n            \"value\": \"ada@example.com\",\n            \"primary\": true,\n            \"label\": \"work\"\n          }\n        ],\n        \"phones\": [\n          {\n            \"value\": \"+1 555 010 0101\",\n            \"primary\": true\n          }\n        ],\n        \"org_id\": 9100001,\n        \"owner_id\": 9900001,\n        \"add_time\": \"2026-10-02T08:00:00Z\",\n        \"update_time\": \"2026-11-12T09:00:00Z\"\n      },\n      {\n        \"id\": 9200002,\n        \"name\": \"Ben Example\",\n        \"first_name\": \"Ben\",\n        \"last_name\": \"Example\",\n        \"emails\": [\n          {\n            \"value\": \"ben@example.com\",\n            \"primary\": true,\n            \"label\": \"work\"\n          }\n        ],\n        \"phones\": [],\n        \"org_id\": 9100002,\n        \"owner_id\": 9900001,\n        \"add_time\": \"2026-10-02T08:00:00Z\",\n        \"update_time\": \"2026-11-12T09:30:00Z\"\n      },\n      {\n        \"id\": 9200003,\n        \"name\": \"Carol Example\",\n        \"first_name\": \"Carol\",\n        \"last_name\": \"Example\",\n        \"emails\": [\n          {\n            \"value\": \"carol@example.com\",\n            \"primary\": true,\n            \"label\": \"work\"\n          }\n        ],\n        \"phones\": [],\n        \"org_id\": 9100002,\n        \"owner_id\": 9900001,\n        \"add_time\": \"2026-10-02T08:00:00Z\",\n        \"update_time\": \"2026-11-12T10:00:00Z\"\n      },\n      {\n        \"id\": 9200004,\n        \"name\": \"Ada Duplicate\",\n        \"first_name\": \"Ada\",\n        \"last_name\": \"Duplicate\",\n        \"emails\": [\n          {\n            \"value\": \"Ada@Example.com\",\n            \"primary\": true,\n            \"label\": \"work\"\n          }\n        ],\n        \"phones\": [],\n        \"org_id\": 9100001,\n        \"owner_id\": 9900001,\n        \"add_time\": \"2026-10-02T08:00:00Z\",\n        \"update_time\": \"2026-11-12T10:30:00Z\"\n      },\n      {\n        \"id\": 9200005,\n        \"name\": \"\",\n        \"first_name\": \"\",\n        \"last_name\": \"\",\n        \"emails\": [],\n        \"phones\": [],\n        \"org_id\": null,\n        \"owner_id\": 9900001,\n        \"add_time\": \"2026-10-02T08:00:00Z\",\n        \"update_time\": \"2026-11-12T11:00:00Z\"\n      },\n      {\n        \"id\": 9200006,\n        \"name\": \"Dan Example\",\n        \"first_name\": \"Dan\",\n        \"last_name\": \"Example\",\n        \"emails\": [\n          {\n            \"value\": \"dan(at)example.com\",\n            \"primary\": true,\n            \"label\": \"work\"\n          }\n        ],\n        \"phones\": [],\n        \"org_id\": 9100004,\n        \"owner_id\": 9900001,\n        \"add_time\": \"2026-10-02T08:00:00Z\",\n        \"update_time\": \"2026-11-12T11:30:00Z\"\n      },\n      {\n        \"id\": 9200007,\n        \"name\": \"Eve Example\",\n        \"first_name\": \"Eve\",\n        \"last_name\": \"Example\",\n        \"emails\": [\n          {\n            \"value\": \"eve@example.com\",\n            \"primary\": true,\n            \"label\": \"work\"\n          }\n        ],\n        \"phones\": [],\n        \"org_id\": 9100099,\n        \"owner_id\": 9900001,\n        \"add_time\": \"2026-10-02T08:00:00Z\",\n        \"update_time\": \"2026-11-12T12:00:00Z\"\n      },\n      {\n        \"id\": 9200008,\n        \"name\": \"Erin Example\",\n        \"first_name\": \"Erin\",\n        \"last_name\": \"Example\",\n        \"emails\": [\n          {\n            \"value\": \"erin@example.com\",\n            \"primary\": true,\n            \"label\": \"work\"\n          }\n        ],\n        \"phones\": [],\n        \"org_id\": 9100004,\n        \"owner_id\": 9900001,\n        \"add_time\": \"2026-10-02T08:00:00Z\",\n        \"update_time\": \"2026-11-13T08:00:00Z\"\n      }\n    ],\n    \"deals\": [\n      {\n        \"id\": 9300001,\n        \"title\": \"Northwind Example - Platform rollout\",\n        \"status\": \"open\",\n        \"stage_id\": 1,\n        \"pipeline_id\": 1,\n        \"value\": 12500,\n        \"currency\": \"USD\",\n        \"org_id\": 9100001,\n        \"person_id\": 9200001,\n        \"owner_id\": 9900001,\n        \"add_time\": \"2026-10-03T08:00:00Z\",\n        \"update_time\": \"2026-11-12T13:00:00Z\",\n        \"expected_close_date\": \"2026-12-15\"\n      },\n      {\n        \"id\": 9300002,\n        \"title\": \"Acme Example - Annual plan\",\n        \"status\": \"won\",\n        \"stage_id\": 3,\n        \"pipeline_id\": 1,\n        \"value\": \"48000.50\",\n        \"currency\": \"USD\",\n        \"org_id\": 9100002,\n        \"person_id\": 9200002,\n        \"owner_id\": 9900001,\n        \"add_time\": \"2026-10-03T08:00:00Z\",\n        \"update_time\": \"2026-11-12T14:00:00Z\",\n        \"won_time\": \"2026-11-11T16:00:00Z\"\n      },\n      {\n        \"id\": 9300003,\n        \"title\": \"Globex Example - Pilot\",\n        \"status\": \"open\",\n        \"stage_id\": 99,\n        \"pipeline_id\": 1,\n        \"value\": 5000,\n        \"currency\": \"USD\",\n        \"org_id\": 9100004,\n        \"person_id\": null,\n        \"owner_id\": 9900001,\n        \"add_time\": \"2026-10-03T08:00:00Z\",\n        \"update_time\": \"2026-11-12T15:00:00Z\"\n      },\n      {\n        \"id\": 9300004,\n        \"title\": \"Globex Example - Expansion\",\n        \"status\": \"open\",\n        \"stage_id\": 2,\n        \"pipeline_id\": 1,\n        \"value\": \"abc\",\n        \"currency\": \"USD\",\n        \"org_id\": 9100004,\n        \"person_id\": 9200008,\n        \"owner_id\": 9900001,\n        \"add_time\": \"2026-10-03T08:00:00Z\",\n        \"update_time\": \"2026-11-13T09:00:00Z\"\n      },\n      {\n        \"id\": 9300005,\n        \"title\": \"Acme Example - Services\",\n        \"status\": \"open\",\n        \"stage_id\": 2,\n        \"pipeline_id\": 1,\n        \"value\": 3000,\n        \"currency\": \"USD\",\n        \"org_id\": 9100002,\n        \"person_id\": 9200003,\n        \"owner_id\": 9900001,\n        \"add_time\": \"2026-10-03T08:00:00Z\",\n        \"update_time\": \"2026-11-13T10:00:00Z\"\n      },\n      {\n        \"id\": 9300006,\n        \"title\": \"Removed Example deal\",\n        \"status\": \"deleted\",\n        \"stage_id\": 1,\n        \"pipeline_id\": 1,\n        \"value\": 100,\n        \"currency\": \"USD\",\n        \"org_id\": null,\n        \"person_id\": null,\n        \"owner_id\": 9900001,\n        \"add_time\": \"2026-10-03T08:00:00Z\",\n        \"update_time\": \"2026-11-13T11:00:00Z\"\n      }\n    ],\n    \"activities\": [\n      {\n        \"id\": 9400001,\n        \"type\": \"call\",\n        \"subject\": \"Discovery call\",\n        \"done\": true,\n        \"due_date\": \"2026-11-12\",\n        \"due_time\": \"15:00\",\n        \"duration\": \"00:25\",\n        \"deal_id\": 9300001,\n        \"person_id\": 9200001,\n        \"org_id\": 9100001,\n        \"note\": \"Discussed rollout scope.\",\n        \"owner_id\": 9900002,\n        \"add_time\": \"2026-11-05T08:00:00Z\",\n        \"update_time\": \"2026-11-13T12:00:00Z\"\n      },\n      {\n        \"id\": 9400002,\n        \"type\": \"call\",\n        \"subject\": \"Follow-up call\",\n        \"done\": false,\n        \"due_date\": \"2026-11-20\",\n        \"due_time\": \"10:00\",\n        \"duration\": null,\n        \"deal_id\": 9300001,\n        \"person_id\": 9200001,\n        \"org_id\": null,\n        \"note\": null,\n        \"owner_id\": 9900002,\n        \"add_time\": \"2026-11-05T08:00:00Z\",\n        \"update_time\": \"2026-11-13T12:05:00Z\"\n      },\n      {\n        \"id\": 9400003,\n        \"type\": \"meeting\",\n        \"subject\": \"Kick-off meeting\",\n        \"done\": true,\n        \"due_date\": \"2026-11-12\",\n        \"due_time\": \"09:00\",\n        \"duration\": \"01:00\",\n        \"deal_id\": 9300002,\n        \"person_id\": 9200002,\n        \"org_id\": 9100002,\n        \"note\": null,\n        \"owner_id\": 9900002,\n        \"add_time\": \"2026-11-05T08:00:00Z\",\n        \"update_time\": \"2026-11-13T12:10:00Z\"\n      },\n      {\n        \"id\": 9400004,\n        \"type\": \"demo\",\n        \"subject\": \"Product demo\",\n        \"done\": false,\n        \"due_date\": \"2026-11-18\",\n        \"due_time\": \"14:00\",\n        \"duration\": null,\n        \"deal_id\": 9300004,\n        \"person_id\": null,\n        \"org_id\": null,\n        \"note\": null,\n        \"owner_id\": 9900002,\n        \"add_time\": \"2026-11-05T08:00:00Z\",\n        \"update_time\": \"2026-11-13T12:15:00Z\"\n      },\n      {\n        \"id\": 9400005,\n        \"type\": \"task\",\n        \"subject\": \"Send proposal\",\n        \"done\": false,\n        \"due_date\": null,\n        \"due_time\": null,\n        \"duration\": null,\n        \"deal_id\": 9300002,\n        \"person_id\": null,\n        \"org_id\": null,\n        \"note\": null,\n        \"owner_id\": 9900002,\n        \"add_time\": \"2026-11-05T08:00:00Z\",\n        \"update_time\": \"2026-11-13T12:20:00Z\"\n      },\n      {\n        \"id\": 9400006,\n        \"type\": \"task\",\n        \"subject\": \"Update CRM notes\",\n        \"done\": false,\n        \"due_date\": \"2026-11-14\",\n        \"due_time\": null,\n        \"duration\": null,\n        \"deal_id\": null,\n        \"person_id\": null,\n        \"org_id\": null,\n        \"note\": null,\n        \"owner_id\": 9900002,\n        \"add_time\": \"2026-11-05T08:00:00Z\",\n        \"update_time\": \"2026-11-13T12:25:00Z\"\n      },\n      {\n        \"id\": 9400007,\n        \"type\": \"deadline\",\n        \"subject\": \"Contract deadline\",\n        \"done\": false,\n        \"due_date\": \"2026-11-30\",\n        \"due_time\": null,\n        \"duration\": null,\n        \"deal_id\": 9300005,\n        \"person_id\": null,\n        \"org_id\": null,\n        \"note\": \"<p>Legal review&nbsp;<b>required</b></p>\",\n        \"owner_id\": 9900002,\n        \"add_time\": \"2026-11-05T08:00:00Z\",\n        \"update_time\": \"2026-11-13T12:30:00Z\"\n      }\n    ]\n  },\n  \"hubspotExisting\": {\n    \"companies\": [\n      {\n        \"id\": \"71000001\",\n        \"properties\": {\n          \"pipedrive_org_id\": \"9100001\",\n          \"name\": \"Northwind Example Co\"\n        }\n      },\n      {\n        \"id\": \"71000004\",\n        \"properties\": {\n          \"pipedrive_org_id\": \"9100004\",\n          \"name\": \"Globex Example Ltd\"\n        }\n      }\n    ],\n    \"contacts\": [\n      {\n        \"id\": \"72000003\",\n        \"properties\": {\n          \"email\": \"carol@example.com\",\n          \"pipedrive_person_id\": null\n        }\n      },\n      {\n        \"id\": \"72000008\",\n        \"properties\": {\n          \"email\": \"erin@example.com\",\n          \"pipedrive_person_id\": \"9200008\"\n        }\n      },\n      {\n        \"id\": \"72000101\",\n        \"properties\": {\n          \"email\": \"frank@example.com\",\n          \"pipedrive_person_id\": \"9200101\"\n        }\n      }\n    ],\n    \"deals\": [],\n    \"calls\": [],\n    \"meetings\": [],\n    \"tasks\": []\n  },\n  \"stateSeed\": {\n    \"version\": 1,\n    \"watermarks\": {\n      \"organizations\": \"2026-11-01T00:00:00Z\",\n      \"persons\": \"2026-11-01T00:00:00Z\",\n      \"deals\": \"2026-11-01T00:00:00Z\",\n      \"activities\": \"2026-11-01T00:00:00Z\"\n    },\n    \"maps\": {\n      \"organizations\": {\n        \"9100001\": {\n          \"id\": \"71000001\",\n          \"h\": \"a58d95e4\"\n        }\n      },\n      \"persons\": {\n        \"9200101\": {\n          \"id\": \"72000101\",\n          \"h\": \"0f0f0f0f\"\n        }\n      },\n      \"deals\": {},\n      \"activities\": {}\n    },\n    \"pending\": [\n      {\n        \"fromEntity\": \"persons\",\n        \"fromType\": \"contacts\",\n        \"fromPd\": \"9200101\",\n        \"toEntity\": \"organizations\",\n        \"toType\": \"companies\",\n        \"toPd\": \"9100002\",\n        \"reason\": \"TARGET_NOT_IN_HUBSPOT\",\n        \"since\": \"2026-11-10T00:00:00.000Z\"\n      }\n    ],\n    \"quarantine\": {},\n    \"runs\": [],\n    \"updatedAt\": \"2026-11-10T00:00:00.000Z\"\n  }\n};\n\nconst loaded = loadState(JSON.parse(JSON.stringify(FIXTURE.stateSeed)), config.stateReset);\nconst state = loaded.state;\nconst extract = {};\nconst requests = {};\nfor (const e of ENTITIES_ALL) {\n  const since = !config.fullResync && state.watermarks[e] ? state.watermarks[e] : config.startDate;\n  requests[e] = { since, url: null };\n  extract[e] = (FIXTURE.pipedrive[e] || [])\n    .filter((r) => String(r.update_time) >= since)\n    .filter((r) => e !== 'deals' || config.pipedrive.dealStatuses.includes(r.status))\n    .sort((a, b) => (String(a.update_time) < String(b.update_time) ? -1 : String(a.update_time) > String(b.update_time) ? 1 : a.id - b.id));\n}\nreturn [{ json: {\n  source: 'synthetic-fixture',\n  extract,\n  truncated: { organizations: false, persons: false, deals: false, activities: false },\n  pageCounts: {},\n  state,\n  stateSource: 'fixture-seed',\n  stateErrors: loaded.errors,\n  requests,\n  hubspotExisting: FIXTURE.hubspotExisting,\n  // In SANDBOX_MODE only, the fixture's example owner / stage maps stand in for\n  // OWNER_MAP_JSON / STAGE_MAP_JSON when those are not set.\n  mappingOverride: {\n    ...(Object.keys(config.mapping.ownerMap).length ? {} : { ownerMap: FIXTURE.sandboxMapping.ownerMap }),\n    ...(config.pipedrive.orgDomainField ? {} : { orgDomainField: FIXTURE._meta.pipedriveDomainFieldKey }),\n    ...(Object.keys(config.mapping.stageMap).length || config.mapping.defaultStage ? {} : { stageMap: FIXTURE.sandboxMapping.stageMap }),\n  },\n} }];\n"
+      },
+      "id": "9aec5e19-bdd5-46d0-ad60-0afba8ee0585",
+      "name": "Load Synthetic Pipedrive Fixture",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        160,
+        -120
+      ],
+      "notes": "SANDBOX only: fictitious Pipedrive records, HubSpot snapshot and state seed."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Full text: DISCLAIMER.md · Licensed under the MIT License. License: MIT © 2026 dhRobin Systems · Provided as-is, see the disclaimer.\n// ============================================================================\n// Load Migration State  (live)\n// Watermarks, ID mapping tables, pending associations and quarantine from\n// workflow static data. Corrupt state stops the run (fail closed) unless\n// STATE_RESET=true. Builds the incremental Pipedrive v2 list URLs:\n//   updated_since=<watermark>  sort_by=update_time asc  limit=PIPEDRIVE_PAGE_SIZE\n// ============================================================================\nconst { config } = $('Config & Safety Gate').first().json;\n// ---- migration state helpers (shared by the state loaders) ------------------\nconst ENTITIES_ALL = ['organizations', 'persons', 'deals', 'activities'];\nfunction freshState() {\n  return {\n    version: 1,\n    watermarks: { organizations: null, persons: null, deals: null, activities: null },\n    maps: { organizations: {}, persons: {}, deals: {}, activities: {} },\n    pending: [],\n    quarantine: {},\n    runs: [],\n    updatedAt: null,\n  };\n}\nfunction validateState(s) {\n  const e = [];\n  if (!s || typeof s !== 'object' || Array.isArray(s)) return ['state is not an object'];\n  if (s.version !== 1) e.push(`unsupported state version ${JSON.stringify(s.version)}`);\n  for (const k of ENTITIES_ALL) {\n    const w = s.watermarks && s.watermarks[k];\n    if (w !== null && w !== undefined && (typeof w !== 'string' || Number.isNaN(Date.parse(w)))) e.push(`watermarks.${k} is not a timestamp`);\n    const m = s.maps && s.maps[k];\n    if (!m || typeof m !== 'object' || Array.isArray(m)) { e.push(`maps.${k} missing`); continue; }\n    for (const [pd, v] of Object.entries(m)) {\n      if (!/^\\d{1,18}$/.test(pd) || !v || !/^\\d{1,20}$/.test(String(v.id)) || typeof v.h !== 'string') { e.push(`maps.${k}.${pd.slice(0, 20)} is invalid`); break; }\n    }\n  }\n  if (!Array.isArray(s.pending) || !s.quarantine || typeof s.quarantine !== 'object' || !Array.isArray(s.runs)) e.push('pending / quarantine / runs missing');\n  return e;\n}\nfunction loadState(raw, reset) {\n  if (raw === undefined || raw === null) return { state: freshState(), source: 'new', errors: [] };\n  const errors = validateState(raw);\n  if (!errors.length) return { state: JSON.parse(JSON.stringify(raw)), source: 'persisted', errors };\n  if (reset) return { state: freshState(), source: 'reset', errors };\n  throw new Error('Migration state failed validation (fail closed, nothing extracted or written): ' + errors.slice(0, 3).join('; ') + '. Inspect workflow static data or set STATE_RESET=true once to rebuild (idempotent upserts make a rebuild safe).');\n}\n\nconst sd = $getWorkflowStaticData('global');\nconst loaded = loadState(sd.migration, config.stateReset);\nconst state = loaded.state;\nconst P = config.pipedrive;\nconst requests = {};\nfor (const e of ENTITIES_ALL) {\n  const since = !config.fullResync && state.watermarks[e] ? state.watermarks[e] : config.startDate;\n  let q = `updated_since=${encodeURIComponent(since)}&sort_by=update_time&sort_direction=asc&limit=${P.pageSize}`;\n  if (e === 'deals') q += `&status=${encodeURIComponent(P.dealStatuses.join(','))}`;\n  requests[e] = { since, url: `${P.base}/api/v2/${e}?${q}` };\n}\nreturn [{ json: { state, stateSource: loaded.source, stateErrors: loaded.errors, requests } }];\n"
+      },
+      "id": "b13252c0-9b80-491e-a0f2-a365f081fa30",
+      "name": "Load Migration State",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        160,
+        300
+      ],
+      "notes": "Watermarks + ID mapping tables from static data; fail closed on corruption."
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $('Load Migration State').first().json.requests.organizations.url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-api-token",
+              "value": "={{ $env.PIPEDRIVE_API_TOKEN }}"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 60000,
+          "pagination": {
+            "pagination": {
+              "paginationMode": "updateAParameterInEachRequest",
+              "parameters": {
+                "parameters": [
+                  {
+                    "type": "qs",
+                    "name": "cursor",
+                    "value": "={{ $response.body.additional_data && $response.body.additional_data.next_cursor ? $response.body.additional_data.next_cursor : undefined }}"
+                  }
+                ]
+              },
+              "paginationCompleteWhen": "other",
+              "completeExpression": "={{ !$response.body.additional_data || !$response.body.additional_data.next_cursor }}",
+              "limitPagesFetched": true,
+              "maxRequests": "={{ $('Config & Safety Gate').first().json.config.pipedrive.maxPages }}",
+              "requestInterval": 250
+            }
+          }
+        }
+      },
+      "id": "fc928a6a-db0c-4f1c-a9cb-d65997351ddb",
+      "name": "Pipedrive: Fetch Organizations",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        380,
+        300
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "notes": "Read-only Pipedrive v2 list of organizations updated since the watermark (cursor pagination, sorted by update_time). Any failure stops the run."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Full text: DISCLAIMER.md · Licensed under the MIT License. License: MIT © 2026 dhRobin Systems · Provided as-is, see the disclaimer.\n// ============================================================================\n// Collect Organization Pages\n// Validates every Pipedrive page (success flag, data array) and fails the run\n// on any malformed page. Pages are sorted by update_time, so a page cap\n// (PIPEDRIVE_MAX_PAGES_PER_ENTITY) leaves a consistent prefix: the backlog is\n// picked up by the next incremental run.\n// ============================================================================\nconst { config } = $('Config & Safety Gate').first().json;\nconst ENTITY = 'organizations';\nconst PREV = null;\nconst pages = $input.all().map((i) => i.json);\nconst prev = PREV ? $(PREV).first().json : { extract: {}, truncated: {}, pageCounts: {} };\nconst byId = new Map();\nfor (const [i, p] of pages.entries()) {\n  if (!p || p.success !== true || !Array.isArray(p.data)) throw new Error(`Pipedrive ${ENTITY} page ${i + 1} is malformed or unsuccessful (${p && p.error ? String(p.error).slice(0, 120) : 'no success flag'}); nothing written.`);\n  for (const r of p.data) {\n    if (!r || !Number.isInteger(r.id)) throw new Error(`Pipedrive ${ENTITY} page ${i + 1} contains a record without an integer id; nothing written.`);\n    const old = byId.get(r.id);\n    if (!old || String(r.update_time) >= String(old.update_time)) byId.set(r.id, r);\n  }\n}\nconst last = pages[pages.length - 1] || {};\nconst nextCursor = last.additional_data && last.additional_data.next_cursor;\nconst truncated = !!nextCursor && pages.length >= config.pipedrive.maxPages;\nif (nextCursor && !truncated) throw new Error(`Pipedrive ${ENTITY} pagination stopped early with a next_cursor; nothing written.`);\nreturn [{ json: {\n  source: 'pipedrive',\n  extract: { ...prev.extract, [ENTITY]: [...byId.values()] },\n  truncated: { ...prev.truncated, [ENTITY]: truncated },\n  pageCounts: { ...prev.pageCounts, [ENTITY]: pages.length },\n} }];\n"
+      },
+      "id": "e168ae03-b3ab-498e-a366-e64ae4c3c0ab",
+      "name": "Collect Organization Pages",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        600,
+        300
+      ],
+      "notes": "Validates organizations pages; fails closed on malformed pages."
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $('Load Migration State').first().json.requests.persons.url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-api-token",
+              "value": "={{ $env.PIPEDRIVE_API_TOKEN }}"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 60000,
+          "pagination": {
+            "pagination": {
+              "paginationMode": "updateAParameterInEachRequest",
+              "parameters": {
+                "parameters": [
+                  {
+                    "type": "qs",
+                    "name": "cursor",
+                    "value": "={{ $response.body.additional_data && $response.body.additional_data.next_cursor ? $response.body.additional_data.next_cursor : undefined }}"
+                  }
+                ]
+              },
+              "paginationCompleteWhen": "other",
+              "completeExpression": "={{ !$response.body.additional_data || !$response.body.additional_data.next_cursor }}",
+              "limitPagesFetched": true,
+              "maxRequests": "={{ $('Config & Safety Gate').first().json.config.pipedrive.maxPages }}",
+              "requestInterval": 250
+            }
+          }
+        }
+      },
+      "id": "d568449d-65fd-4f8d-aef7-4434acab5da3",
+      "name": "Pipedrive: Fetch Persons",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        820,
+        300
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "notes": "Read-only Pipedrive v2 list of persons updated since the watermark (cursor pagination, sorted by update_time). Any failure stops the run."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Full text: DISCLAIMER.md · Licensed under the MIT License. License: MIT © 2026 dhRobin Systems · Provided as-is, see the disclaimer.\n// ============================================================================\n// Collect Person Pages\n// Validates every Pipedrive page (success flag, data array) and fails the run\n// on any malformed page. Pages are sorted by update_time, so a page cap\n// (PIPEDRIVE_MAX_PAGES_PER_ENTITY) leaves a consistent prefix: the backlog is\n// picked up by the next incremental run.\n// ============================================================================\nconst { config } = $('Config & Safety Gate').first().json;\nconst ENTITY = 'persons';\nconst PREV = 'Collect Organization Pages';\nconst pages = $input.all().map((i) => i.json);\nconst prev = PREV ? $(PREV).first().json : { extract: {}, truncated: {}, pageCounts: {} };\nconst byId = new Map();\nfor (const [i, p] of pages.entries()) {\n  if (!p || p.success !== true || !Array.isArray(p.data)) throw new Error(`Pipedrive ${ENTITY} page ${i + 1} is malformed or unsuccessful (${p && p.error ? String(p.error).slice(0, 120) : 'no success flag'}); nothing written.`);\n  for (const r of p.data) {\n    if (!r || !Number.isInteger(r.id)) throw new Error(`Pipedrive ${ENTITY} page ${i + 1} contains a record without an integer id; nothing written.`);\n    const old = byId.get(r.id);\n    if (!old || String(r.update_time) >= String(old.update_time)) byId.set(r.id, r);\n  }\n}\nconst last = pages[pages.length - 1] || {};\nconst nextCursor = last.additional_data && last.additional_data.next_cursor;\nconst truncated = !!nextCursor && pages.length >= config.pipedrive.maxPages;\nif (nextCursor && !truncated) throw new Error(`Pipedrive ${ENTITY} pagination stopped early with a next_cursor; nothing written.`);\nreturn [{ json: {\n  source: 'pipedrive',\n  extract: { ...prev.extract, [ENTITY]: [...byId.values()] },\n  truncated: { ...prev.truncated, [ENTITY]: truncated },\n  pageCounts: { ...prev.pageCounts, [ENTITY]: pages.length },\n} }];\n"
+      },
+      "id": "5144a953-8676-4d6f-af98-21c7903d7fa8",
+      "name": "Collect Person Pages",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1040,
+        300
+      ],
+      "notes": "Validates persons pages; fails closed on malformed pages."
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $('Load Migration State').first().json.requests.deals.url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-api-token",
+              "value": "={{ $env.PIPEDRIVE_API_TOKEN }}"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 60000,
+          "pagination": {
+            "pagination": {
+              "paginationMode": "updateAParameterInEachRequest",
+              "parameters": {
+                "parameters": [
+                  {
+                    "type": "qs",
+                    "name": "cursor",
+                    "value": "={{ $response.body.additional_data && $response.body.additional_data.next_cursor ? $response.body.additional_data.next_cursor : undefined }}"
+                  }
+                ]
+              },
+              "paginationCompleteWhen": "other",
+              "completeExpression": "={{ !$response.body.additional_data || !$response.body.additional_data.next_cursor }}",
+              "limitPagesFetched": true,
+              "maxRequests": "={{ $('Config & Safety Gate').first().json.config.pipedrive.maxPages }}",
+              "requestInterval": 250
+            }
+          }
+        }
+      },
+      "id": "f11aa2d9-b568-42dd-aaad-e2f1d7844d59",
+      "name": "Pipedrive: Fetch Deals",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1260,
+        300
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "notes": "Read-only Pipedrive v2 list of deals updated since the watermark (cursor pagination, sorted by update_time). Any failure stops the run."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Full text: DISCLAIMER.md · Licensed under the MIT License. License: MIT © 2026 dhRobin Systems · Provided as-is, see the disclaimer.\n// ============================================================================\n// Collect Deal Pages\n// Validates every Pipedrive page (success flag, data array) and fails the run\n// on any malformed page. Pages are sorted by update_time, so a page cap\n// (PIPEDRIVE_MAX_PAGES_PER_ENTITY) leaves a consistent prefix: the backlog is\n// picked up by the next incremental run.\n// ============================================================================\nconst { config } = $('Config & Safety Gate').first().json;\nconst ENTITY = 'deals';\nconst PREV = 'Collect Person Pages';\nconst pages = $input.all().map((i) => i.json);\nconst prev = PREV ? $(PREV).first().json : { extract: {}, truncated: {}, pageCounts: {} };\nconst byId = new Map();\nfor (const [i, p] of pages.entries()) {\n  if (!p || p.success !== true || !Array.isArray(p.data)) throw new Error(`Pipedrive ${ENTITY} page ${i + 1} is malformed or unsuccessful (${p && p.error ? String(p.error).slice(0, 120) : 'no success flag'}); nothing written.`);\n  for (const r of p.data) {\n    if (!r || !Number.isInteger(r.id)) throw new Error(`Pipedrive ${ENTITY} page ${i + 1} contains a record without an integer id; nothing written.`);\n    const old = byId.get(r.id);\n    if (!old || String(r.update_time) >= String(old.update_time)) byId.set(r.id, r);\n  }\n}\nconst last = pages[pages.length - 1] || {};\nconst nextCursor = last.additional_data && last.additional_data.next_cursor;\nconst truncated = !!nextCursor && pages.length >= config.pipedrive.maxPages;\nif (nextCursor && !truncated) throw new Error(`Pipedrive ${ENTITY} pagination stopped early with a next_cursor; nothing written.`);\nreturn [{ json: {\n  source: 'pipedrive',\n  extract: { ...prev.extract, [ENTITY]: [...byId.values()] },\n  truncated: { ...prev.truncated, [ENTITY]: truncated },\n  pageCounts: { ...prev.pageCounts, [ENTITY]: pages.length },\n} }];\n"
+      },
+      "id": "6191e285-d189-4fd7-ae37-8233c7227eb3",
+      "name": "Collect Deal Pages",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1480,
+        300
+      ],
+      "notes": "Validates deals pages; fails closed on malformed pages."
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $('Load Migration State').first().json.requests.activities.url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-api-token",
+              "value": "={{ $env.PIPEDRIVE_API_TOKEN }}"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 60000,
+          "pagination": {
+            "pagination": {
+              "paginationMode": "updateAParameterInEachRequest",
+              "parameters": {
+                "parameters": [
+                  {
+                    "type": "qs",
+                    "name": "cursor",
+                    "value": "={{ $response.body.additional_data && $response.body.additional_data.next_cursor ? $response.body.additional_data.next_cursor : undefined }}"
+                  }
+                ]
+              },
+              "paginationCompleteWhen": "other",
+              "completeExpression": "={{ !$response.body.additional_data || !$response.body.additional_data.next_cursor }}",
+              "limitPagesFetched": true,
+              "maxRequests": "={{ $('Config & Safety Gate').first().json.config.pipedrive.maxPages }}",
+              "requestInterval": 250
+            }
+          }
+        }
+      },
+      "id": "4df97251-09c2-4bcf-a751-3ac3c2b6ba4f",
+      "name": "Pipedrive: Fetch Activities",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1700,
+        300
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "notes": "Read-only Pipedrive v2 list of activities updated since the watermark (cursor pagination, sorted by update_time). Any failure stops the run."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Full text: DISCLAIMER.md · Licensed under the MIT License. License: MIT © 2026 dhRobin Systems · Provided as-is, see the disclaimer.\n// ============================================================================\n// Collect Activity Pages\n// Validates every Pipedrive page (success flag, data array) and fails the run\n// on any malformed page. Pages are sorted by update_time, so a page cap\n// (PIPEDRIVE_MAX_PAGES_PER_ENTITY) leaves a consistent prefix: the backlog is\n// picked up by the next incremental run.\n// ============================================================================\nconst { config } = $('Config & Safety Gate').first().json;\nconst ENTITY = 'activities';\nconst PREV = 'Collect Deal Pages';\nconst pages = $input.all().map((i) => i.json);\nconst prev = PREV ? $(PREV).first().json : { extract: {}, truncated: {}, pageCounts: {} };\nconst byId = new Map();\nfor (const [i, p] of pages.entries()) {\n  if (!p || p.success !== true || !Array.isArray(p.data)) throw new Error(`Pipedrive ${ENTITY} page ${i + 1} is malformed or unsuccessful (${p && p.error ? String(p.error).slice(0, 120) : 'no success flag'}); nothing written.`);\n  for (const r of p.data) {\n    if (!r || !Number.isInteger(r.id)) throw new Error(`Pipedrive ${ENTITY} page ${i + 1} contains a record without an integer id; nothing written.`);\n    const old = byId.get(r.id);\n    if (!old || String(r.update_time) >= String(old.update_time)) byId.set(r.id, r);\n  }\n}\nconst last = pages[pages.length - 1] || {};\nconst nextCursor = last.additional_data && last.additional_data.next_cursor;\nconst truncated = !!nextCursor && pages.length >= config.pipedrive.maxPages;\nif (nextCursor && !truncated) throw new Error(`Pipedrive ${ENTITY} pagination stopped early with a next_cursor; nothing written.`);\nreturn [{ json: {\n  source: 'pipedrive',\n  extract: { ...prev.extract, [ENTITY]: [...byId.values()] },\n  truncated: { ...prev.truncated, [ENTITY]: truncated },\n  pageCounts: { ...prev.pageCounts, [ENTITY]: pages.length },\n} }];\n"
+      },
+      "id": "f044b04a-e69d-4924-ac34-a128aae6528b",
+      "name": "Collect Activity Pages",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1920,
+        300
+      ],
+      "notes": "Validates activities pages; fails closed on malformed pages."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Full text: DISCLAIMER.md · Licensed under the MIT License. License: MIT © 2026 dhRobin Systems · Provided as-is, see the disclaimer.\n// ============================================================================\n// Normalize & Validate\n// Maps Pipedrive v2 records to HubSpot payloads and records every validation\n// issue. Errors quarantine a record (never written, listed in the report);\n// warnings are written with the issue attached.\n//   organizations -> companies   persons -> contacts   deals -> deals\n//   activities    -> calls / meetings / tasks (ACTIVITY_TYPE_MAP_JSON)\n// Each payload carries the unique pipedrive_*_id property that makes every\n// HubSpot write an idempotent upsert. A content hash lets reruns skip\n// records that did not change.\n// ============================================================================\nconst { config } = $('Config & Safety Gate').first().json;\nconst src = $input.first().json;\nconst live = src.source === 'pipedrive';\nconst st = live ? $('Load Migration State').first().json : src;\nconst state = st.state;\nconst M = { ...config.mapping, ...(src.mappingOverride || {}) };\nconst H = config.hubspot;\nconst MAX_TEXT = 65000;\n\nfunction fnv1a(s) { let h = 0x811c9dc5; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; } return h.toString(16).padStart(8, '0'); }\nconst stable = (o) => JSON.stringify(Object.keys(o).sort().reduce((a, k) => { a[k] = o[k]; return a; }, {}));\nconst EMAIL_RE = /^[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}$/i;\nconst clean = (v) => (v === null || v === undefined ? '' : String(v).replace(/<[^>]*>/g, ' ').replace(/&nbsp;/g, ' ').replace(/\\s+/g, ' ').trim());\nconst fkId = (v) => (v && typeof v === 'object' ? (Number.isInteger(v.value) ? v.value : Number.isInteger(v.id) ? v.id : null) : Number.isInteger(v) ? v : null);\nfunction iso(v) {\n  if (!v) return null;\n  const s = String(v).trim();\n  const t = /^\\d{4}-\\d{2}-\\d{2}$/.test(s) ? Date.parse(s + 'T00:00:00Z') : Date.parse(/[zZ]|[+-]\\d{2}:?\\d{2}$/.test(s) ? s : s.replace(' ', 'T') + 'Z');\n  return Number.isNaN(t) ? null : new Date(t).toISOString();\n}\nfunction primary(arr) {\n  if (!Array.isArray(arr)) return '';\n  const p = arr.find((x) => x && x.primary) || arr[0];\n  return p && p.value ? String(p.value).trim() : '';\n}\nfunction owner(r, rec) {\n  const o = r.owner_id === undefined || r.owner_id === null ? null : String(fkId(r.owner_id) || r.owner_id);\n  if (!o) return;\n  if (M.ownerMap[o]) rec.properties.hubspot_owner_id = M.ownerMap[o];\n  else rec.issues.push({ code: 'OWNER_UNMAPPED', severity: 'warning', detail: `Pipedrive owner ${o} has no OWNER_MAP_JSON entry; owner left blank` });\n}\nfunction limit(rec, k) { const v = rec.properties[k]; if (typeof v === 'string' && v.length > MAX_TEXT) { rec.properties[k] = v.slice(0, MAX_TEXT); rec.issues.push({ code: 'TEXT_TRUNCATED', severity: 'warning', detail: `${k} truncated to ${MAX_TEXT} characters` }); } }\nconst base = (entity, r, objectType) => ({ entity, pdId: String(r.id), objectType, idProperty: H.idProps[entity], updateTime: String(r.update_time || ''), properties: { [H.idProps[entity]]: String(r.id) }, refs: {}, issues: [], emailKey: null });\n\nconst records = [];\n// ---- organizations -> companies --------------------------------------------------\nfor (const r of src.extract.organizations || []) {\n  const rec = base('organizations', r, 'companies');\n  const name = clean(r.name);\n  if (!name) rec.issues.push({ code: 'ORG_MISSING_NAME', severity: 'error', detail: 'Organization has no name' });\n  rec.properties.name = name;\n  const a = r.address && typeof r.address === 'object' ? r.address : {};\n  if (a.formatted_address || a.value) rec.properties.address = clean(a.formatted_address || a.value);\n  if (a.locality) rec.properties.city = clean(a.locality);\n  if (a.country) rec.properties.country = clean(a.country);\n  if (a.postal_code) rec.properties.zip = clean(a.postal_code);\n  const domainField = (src.mappingOverride && src.mappingOverride.orgDomainField) || config.pipedrive.orgDomainField;\n  if (domainField) {\n    const raw = r.custom_fields && r.custom_fields[domainField];\n    const d = String((raw && raw.value) || raw || '').trim().toLowerCase().replace(/^https?:\\/\\//, '').replace(/^www\\./, '').replace(/\\/.*$/, '');\n    if (d && /^[a-z0-9-]+(\\.[a-z0-9-]+)+$/.test(d)) rec.properties.domain = d;\n    else if (d) rec.issues.push({ code: 'ORG_INVALID_DOMAIN', severity: 'warning', detail: 'Website/domain value is not a valid domain; omitted' });\n  }\n  owner(r, rec);\n  records.push(rec);\n}\n// ---- persons -> contacts ------------------------------------------------------------\nconst seenEmails = new Map();\nfor (const r of src.extract.persons || []) {\n  const rec = base('persons', r, 'contacts');\n  let first = clean(r.first_name), last = clean(r.last_name);\n  const full = clean(r.name);\n  if (!first && !last && full) { const parts = full.split(' '); first = parts.shift(); last = parts.join(' '); }\n  if (first) rec.properties.firstname = first;\n  if (last) rec.properties.lastname = last;\n  const email = primary(r.emails).toLowerCase();\n  if (email && EMAIL_RE.test(email)) {\n    if (seenEmails.has(email)) rec.issues.push({ code: 'DUPLICATE_EMAIL_IN_SOURCE', severity: 'error', detail: `Email also used by Pipedrive person ${seenEmails.get(email)}; HubSpot contact emails are unique` });\n    else { seenEmails.set(email, rec.pdId); rec.properties.email = email; rec.emailKey = email; }\n  } else if (email) rec.issues.push({ code: 'PERSON_INVALID_EMAIL', severity: 'warning', detail: 'Primary email is not a valid address; omitted' });\n  const phone = primary(r.phones);\n  if (phone) rec.properties.phone = phone.slice(0, 50);\n  if (!first && !last && !rec.properties.email) rec.issues.push({ code: 'PERSON_MISSING_NAME_AND_EMAIL', severity: 'error', detail: 'Person has neither a name nor a valid email' });\n  const org = fkId(r.org_id);\n  if (org) rec.refs.organizations = String(org);\n  owner(r, rec);\n  records.push(rec);\n}\n// ---- deals -> deals ---------------------------------------------------------------------\nfor (const r of src.extract.deals || []) {\n  const rec = base('deals', r, 'deals');\n  const title = clean(r.title);\n  if (!title) rec.issues.push({ code: 'DEAL_MISSING_TITLE', severity: 'error', detail: 'Deal has no title' });\n  rec.properties.dealname = title;\n  if (r.value !== null && r.value !== undefined && r.value !== '') {\n    const n = Number(r.value);\n    if (Number.isFinite(n) && n >= 0 && n < 1e15) rec.properties.amount = String(Math.round(n * 100) / 100);\n    else rec.issues.push({ code: 'DEAL_INVALID_AMOUNT', severity: 'warning', detail: 'Deal value is not a non-negative number; amount omitted' });\n  }\n  if (H.mapDealCurrency && /^[A-Z]{3}$/.test(String(r.currency || ''))) rec.properties.deal_currency_code = r.currency;\n  const stage = r.status === 'won' || r.status === 'lost' ? M.stageMap[r.status] || M.stageMap[String(r.stage_id)] : M.stageMap[String(r.stage_id)];\n  const st2 = stage || M.defaultStage;\n  if (st2) { rec.properties.pipeline = st2.pipeline; rec.properties.dealstage = st2.dealstage; if (!stage) rec.issues.push({ code: 'DEAL_DEFAULT_STAGE_USED', severity: 'warning', detail: `Stage ${r.stage_id} unmapped; DEFAULT_DEAL_STAGE used` }); }\n  else rec.issues.push({ code: 'DEAL_UNMAPPED_STAGE', severity: 'error', detail: `Pipedrive stage ${r.stage_id} (${r.status}) has no STAGE_MAP_JSON entry` });\n  const close = iso(r.won_time || r.lost_time || r.close_time) || iso(r.expected_close_date);\n  if (close) rec.properties.closedate = close;\n  const org = fkId(r.org_id), per = fkId(r.person_id);\n  if (org) rec.refs.organizations = String(org);\n  if (per) rec.refs.persons = String(per);\n  owner(r, rec);\n  records.push(rec);\n}\n// ---- activities -> calls / meetings / tasks ----------------------------------------------\nfor (const r of src.extract.activities || []) {\n  const type = String(r.type || '').toLowerCase();\n  // An activity keeps the HubSpot object type it was first migrated as, so a\n  // later Pipedrive change (e.g. a planned call marked done) cannot create a\n  // second record in another object type. Open calls become CALL tasks\n  // because HubSpot calls have no \"scheduled\" status.\n  const pinned = state.maps.activities[String(r.id)] && state.maps.activities[String(r.id)].t;\n  let objectType = pinned || M.activityTypeMap[type] || 'tasks';\n  if (!pinned && objectType === 'calls' && !r.done) objectType = 'tasks';\n  const rec = base('activities', r, objectType);\n  if (!M.activityTypeMap[type]) rec.issues.push({ code: 'ACTIVITY_TYPE_DEFAULTED', severity: 'warning', detail: `Activity type \"${type.slice(0, 40)}\" unmapped; migrated as a task` });\n  const subject = clean(r.subject) || `Pipedrive ${type || 'activity'} ${r.id}`;\n  const body = clean(r.note || r.public_description || '');\n  let ts = iso(r.due_date ? `${r.due_date}${r.due_time ? 'T' + String(r.due_time).slice(0, 5) + ':00Z' : ''}` : null);\n  if (!ts) { ts = iso(r.add_time); if (ts) rec.issues.push({ code: 'ACTIVITY_NO_DUE_DATE', severity: 'warning', detail: 'No valid due date; add_time used as timestamp' }); }\n  if (!ts) rec.issues.push({ code: 'ACTIVITY_INVALID_DATE', severity: 'error', detail: 'No valid due date or add time' });\n  else rec.properties.hs_timestamp = ts;\n  const durMin = (() => { const m = String(r.duration || '').match(/^(\\d{1,2}):(\\d{2})/); return m ? Number(m[1]) * 60 + Number(m[2]) : 0; })();\n  if (objectType === 'calls') { rec.properties.hs_call_title = subject; if (body) rec.properties.hs_call_body = body; rec.properties.hs_call_status = r.done ? 'COMPLETED' : 'QUEUED'; if (durMin) rec.properties.hs_call_duration = String(durMin * 60000); }\n  else if (objectType === 'meetings') { rec.properties.hs_meeting_title = subject; if (body) rec.properties.hs_meeting_body = body; if (ts) { rec.properties.hs_meeting_start_time = ts; rec.properties.hs_meeting_end_time = new Date(Date.parse(ts) + (durMin || 30) * 60000).toISOString(); } rec.properties.hs_meeting_outcome = r.done ? 'COMPLETED' : 'SCHEDULED'; }\n  else { rec.properties.hs_task_subject = subject; if (body) rec.properties.hs_task_body = body; rec.properties.hs_task_status = r.done ? 'COMPLETED' : 'NOT_STARTED'; rec.properties.hs_task_type = type === 'email' ? 'EMAIL' : type === 'call' ? 'CALL' : 'TODO'; }\n  const d = fkId(r.deal_id), p = fkId(r.person_id), o = fkId(r.org_id);\n  if (d) rec.refs.deals = String(d);\n  if (p) rec.refs.persons = String(p);\n  if (o) rec.refs.organizations = String(o);\n  if (!d && !p && !o) rec.issues.push({ code: 'ACTIVITY_NO_PARENT', severity: 'warning', detail: 'Activity is not linked to a deal, person or organization' });\n  owner(r, rec);\n  for (const k of Object.keys(rec.properties)) limit(rec, k);\n  records.push(rec);\n}\nfor (const rec of records) {\n  rec.hash = fnv1a(stable(rec.properties) + '|' + stable(rec.refs) + '|' + rec.objectType);\n  rec.quarantined = rec.issues.some((i) => i.severity === 'error');\n}\nreturn [{ json: {\n  source: src.source,\n  state,\n  stateSource: st.stateSource,\n  requests: st.requests,\n  truncated: src.truncated,\n  pageCounts: src.pageCounts,\n  hubspotExisting: src.hubspotExisting || null,\n  records,\n  extractedCounts: Object.fromEntries(Object.entries(src.extract).map(([k, v]) => [k, v.length])),\n  maxUpdateTime: Object.fromEntries(Object.entries(src.extract).map(([k, v]) => [k, v.reduce((m, r) => (String(r.update_time) > m ? String(r.update_time) : m), '')])),\n} }];\n"
+      },
+      "id": "284d9c99-fa7d-4f8c-afc7-6106b571f88d",
+      "name": "Normalize & Validate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2140,
+        100
+      ],
+      "notes": "Pipedrive v2 → HubSpot payloads, validation issues, content hashes."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Full text: DISCLAIMER.md · Licensed under the MIT License. License: MIT © 2026 dhRobin Systems · Provided as-is, see the disclaimer.\n// ============================================================================\n// Build Preflight Lookups  (read-only)\n// HubSpot batch reads by unique property for:\n//   * records not yet in the local ID mapping table (create vs update),\n//   * foreign keys pointing outside this extract (FK resolution),\n//   * targets of pending associations from earlier runs,\n//   * every contact email (conflicts with contacts created outside the\n//     migration, since HubSpot contact emails are unique).\n// Emits one item per batch read, or a single { noop: true } item.\n// ============================================================================\nconst { config } = $('Config & Safety Gate').first().json;\nconst b = $input.first().json;\nconst H = config.hubspot;\nconst maps = b.state.maps;\nconst TYPE = H.objectTypes;\nconst inExtract = {};\nfor (const r of b.records) (inExtract[r.entity] = inExtract[r.entity] || new Set()).add(r.pdId);\nconst wanted = {}; // `${objectType}|${idProperty}` -> Set(ids)\nconst want = (objectType, idProperty, id) => { const k = `${objectType}|${idProperty}`; (wanted[k] = wanted[k] || new Set()).add(String(id)); };\nconst active = b.records.filter((r) => !r.quarantined && config.entities.includes(r.entity));\nfor (const r of active) {\n  if (!maps[r.entity][r.pdId]) {\n    if (r.entity === 'activities') for (const t of ['calls', 'meetings', 'tasks']) want(t, r.idProperty, r.pdId);\n    else want(r.objectType, r.idProperty, r.pdId);\n  }\n  for (const [ent, pd] of Object.entries(r.refs)) if (!maps[ent][pd] && !(inExtract[ent] && inExtract[ent].has(pd))) want(TYPE[ent], H.idProps[ent], pd);\n  if (r.emailKey) want('contacts', 'email', r.emailKey);\n}\nfor (const p of b.state.pending || []) {\n  if (!maps[p.fromEntity][p.fromPd]) { if (p.fromEntity === 'activities') want(p.fromType, H.idProps.activities, p.fromPd); else want(TYPE[p.fromEntity], H.idProps[p.fromEntity], p.fromPd); }\n  if (!maps[p.toEntity][p.toPd]) want(TYPE[p.toEntity], H.idProps[p.toEntity], p.toPd);\n}\nconst items = [];\nfor (const [k, set] of Object.entries(wanted)) {\n  const [objectType, idProperty] = k.split('|');\n  const ids = [...set].sort();\n  for (let i = 0; i < ids.length; i += H.batchSize) {\n    const chunk = ids.slice(i, i + H.batchSize);\n    const properties = [...new Set([idProperty, ...(objectType === 'contacts' ? ['email', H.idProps.persons] : [])])];\n    items.push({ json: {\n      mode: config.sandboxMode ? 'simulate' : 'live', objectType, idProperty, ids: chunk,\n      url: config.sandboxMode ? null : `${H.base}/crm/v3/objects/${objectType}/batch/read`,\n      body: { idProperty, properties, inputs: chunk.map((id) => ({ id })) },\n    } });\n  }\n}\nreturn items.length ? items : [{ json: { noop: true } }];\n"
+      },
+      "id": "70d09de6-99e2-4cb5-aa8b-cb57e4702a64",
+      "name": "Build Preflight Lookups",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2360,
+        100
+      ],
+      "notes": "Read-only batch reads by unique property + contact emails."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "bd4aaf1b-0c75-431b-a39e-4bcffe0ffe29",
+              "leftValue": "={{ $json.noop !== true }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "1ac9ed9d-a81e-4df4-ad86-4b5763d42e55",
+      "name": "Lookups Needed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2580,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "f9cbd01a-b86c-4ab0-a36f-4e3509bfa7bb",
+              "leftValue": "={{ $json.mode === 'simulate' }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "12e6edb2-4107-47a5-a48d-df0450cfe91d",
+      "name": "Sandbox Lookup?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2800,
+        -40
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Full text: DISCLAIMER.md · Licensed under the MIT License. License: MIT © 2026 dhRobin Systems · Provided as-is, see the disclaimer.\n// ============================================================================\n// Simulated HubSpot Lookup  (SANDBOX_MODE only; zero network calls)\n// Answers the preflight batch reads from the fixture's synthetic\n// \"already in HubSpot\" snapshot, in HubSpot's batch-read response shape.\n// ============================================================================\nconst existing = $('Load Synthetic Pipedrive Fixture').first().json.hubspotExisting || {};\nreturn $input.all().map((item) => {\n  const q = item.json;\n  const pool = existing[q.objectType] || [];\n  const results = pool.filter((o) => q.ids.includes(String(o.properties[q.idProperty] || '').toLowerCase()) || q.ids.includes(String(o.properties[q.idProperty] || '')))\n    .map((o) => ({ id: String(o.id), properties: Object.fromEntries(q.body.properties.map((p) => [p, o.properties[p] === undefined ? null : o.properties[p]])) }));\n  return { json: { status: 'COMPLETE', results } };\n});\n"
+      },
+      "id": "2b462b02-1d6c-4041-a221-0dc18d5e2f48",
+      "name": "Simulated HubSpot Lookup",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3020,
+        -180
+      ],
+      "notes": "SANDBOX only: answers lookups from the fixture snapshot."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_PRIVATE_APP_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.body) }}",
+        "options": {
+          "timeout": 60000,
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 150
+            }
+          }
+        }
+      },
+      "id": "66bd5da3-c00c-4692-abd7-0384b63a221a",
+      "name": "HubSpot: Preflight Batch Read",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3020,
+        60
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "notes": "Read-only batch read by unique property. Any failure stops the run (fail closed)."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Full text: DISCLAIMER.md · Licensed under the MIT License. License: MIT © 2026 dhRobin Systems · Provided as-is, see the disclaimer.\n// ============================================================================\n// Collect Preflight Results\n// Fails closed if any lookup failed (an incomplete lookup could hide an email\n// conflict or a foreign key). Produces:\n//   found[objectType][pipedriveId] = HubSpot id\n//   emailOwners[email] = { id, pipedriveId }\n// ============================================================================\nconst items = $input.all().map((i) => i.json);\nconst found = {};\nconst emailOwners = {};\nlet lookups = 0;\nif (!(items.length === 1 && items[0].noop)) {\n  const reqs = $('Build Preflight Lookups').all().map((i) => i.json).filter((q) => !q.noop);\n  if (reqs.length !== items.length) throw new Error(`Preflight returned ${items.length} responses for ${reqs.length} lookups; nothing written.`);\n  const H = $('Config & Safety Gate').first().json.config.hubspot;\n  items.forEach((res, i) => {\n    const q = reqs[i];\n    if (!res || res.error || !Array.isArray(res.results)) throw new Error(`HubSpot preflight lookup failed for ${q.objectType} by ${q.idProperty}: ${res && res.error ? String(res.error.message || res.error).slice(0, 160) : 'unexpected response'}. Nothing written (fail closed).`);\n    lookups++;\n    for (const r of res.results) {\n      const p = r.properties || {};\n      if (q.idProperty === 'email') { if (p.email) emailOwners[String(p.email).toLowerCase()] = { id: String(r.id), pipedriveId: p[H.idProps.persons] ? String(p[H.idProps.persons]) : null }; }\n      else if (p[q.idProperty]) (found[q.objectType] = found[q.objectType] || {})[String(p[q.idProperty])] = String(r.id);\n    }\n  });\n}\nreturn [{ json: { found, emailOwners, lookups } }];\n"
+      },
+      "id": "d61df060-1846-41e9-ae17-8d4c48e4d30d",
+      "name": "Collect Preflight Results",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3240,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Full text: DISCLAIMER.md · Licensed under the MIT License. License: MIT © 2026 dhRobin Systems · Provided as-is, see the disclaimer.\n// ============================================================================\n// Migration Plan & Validation Report\n// Classifies every extracted record:\n//   CREATE / UPDATE     -> idempotent batch upsert by pipedrive_*_id\n//   SKIP_UNCHANGED      -> already migrated with an identical content hash\n//   QUARANTINE          -> validation error; never written, listed with reasons\n//   SKIP_ENTITY_DISABLED-> entity not in ENTITIES\n// Resolves contact email conflicts (CONTACT_EMAIL_CONFLICT_POLICY), plans\n// associations from Pipedrive foreign keys, and applies the run guards\n// (MAX_WRITES_PER_RUN, MAX_QUARANTINE_PCT). The report is the dry-run output.\n// ============================================================================\nconst { config } = $('Config & Safety Gate').first().json;\nconst N = $('Normalize & Validate').first().json;\nconst pre = $input.first().json;\nconst H = config.hubspot;\nconst maps = N.state.maps;\nconst TYPE = H.objectTypes;\nconst ACT = ['calls', 'meetings', 'tasks'];\nfunction fnv1a(s) { let h = 0x811c9dc5; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; } return h.toString(16).padStart(8, '0'); }\nconst stable = (o) => JSON.stringify(Object.keys(o).sort().reduce((a, k) => { a[k] = o[k]; return a; }, {}));\nconst foundId = (objectType, pd) => (pre.found[objectType] || {})[pd] || null;\n\nconst writtenInRun = {}; // entity -> Set(pd) planned for write (FK targets resolvable after the write)\nconst planned = N.records.map((r0) => {\n  const r = JSON.parse(JSON.stringify(r0));\n  r.action = null; r.mode = 'upsert'; r.existingId = null;\n  if (!config.entities.includes(r.entity)) { r.action = 'SKIP_ENTITY_DISABLED'; return r; }\n  if (r.quarantined) { r.action = 'QUARANTINE'; return r; }\n  const mapped = maps[r.entity][r.pdId];\n  if (mapped) r.existingId = String(mapped.id);\n  else if (r.entity === 'activities') {\n    const hit = ACT.find((t) => foundId(t, r.pdId));\n    if (hit && hit !== r.objectType) { r.issues.push({ code: 'ACTIVITY_TYPE_MISMATCH_EXISTING', severity: 'error', detail: `Already exists in HubSpot as ${hit} ${foundId(hit, r.pdId)}, planned as ${r.objectType}` }); r.action = 'QUARANTINE'; r.quarantined = true; return r; }\n    if (hit) r.existingId = foundId(hit, r.pdId);\n  } else r.existingId = foundId(r.objectType, r.pdId);\n  if (r.entity === 'persons' && r.emailKey) {\n    const owner = pre.emailOwners[r.emailKey];\n    if (owner && owner.pipedriveId !== r.pdId && owner.id !== r.existingId) {\n      const policy = config.mapping.emailConflictPolicy;\n      if (policy === 'strip_email') {\n        delete r.properties.email;\n        r.issues.push({ code: 'CONTACT_EMAIL_STRIPPED', severity: 'warning', detail: `Email belongs to HubSpot contact ${owner.id}; migrated without email` });\n        r.hash = fnv1a(stable(r.properties) + '|' + stable(r.refs) + '|' + r.objectType);\n      } else if (policy === 'adopt' && !r.existingId && !owner.pipedriveId) {\n        r.mode = 'update'; r.existingId = owner.id;\n        r.issues.push({ code: 'CONTACT_ADOPTED_BY_EMAIL', severity: 'warning', detail: `Existing HubSpot contact ${owner.id} with the same email is adopted and tagged with the Pipedrive id` });\n      } else {\n        r.issues.push({ code: 'CONTACT_EMAIL_CONFLICT', severity: 'error', detail: `Email already used by HubSpot contact ${owner.id}${owner.pipedriveId ? ' (Pipedrive person ' + owner.pipedriveId + ')' : ''}` });\n        r.action = 'QUARANTINE'; r.quarantined = true; return r;\n      }\n    }\n  }\n  if (mapped && mapped.h === r.hash && !config.fullResync && r.mode === 'upsert') r.action = 'SKIP_UNCHANGED';\n  else r.action = r.existingId ? 'UPDATE' : 'CREATE';\n  if (['CREATE', 'UPDATE'].includes(r.action)) (writtenInRun[r.entity] = writtenInRun[r.entity] || new Set()).add(r.pdId);\n  return r;\n});\n\n// ---- associations planned from foreign keys -------------------------------------------\nconst intents = [];\nconst seen = new Set();\nconst addIntent = (it) => { const k = `${it.fromType}|${it.fromPd}|${it.toType}|${it.toPd}`; if (!seen.has(k)) { seen.add(k); intents.push(it); } };\nfor (const r of planned) {\n  if (!['CREATE', 'UPDATE'].includes(r.action)) continue;\n  for (const [ent, pd] of Object.entries(r.refs)) if (config.entities.includes(ent)) addIntent({ fromEntity: r.entity, fromType: r.objectType, fromPd: r.pdId, toEntity: ent, toType: TYPE[ent], toPd: pd });\n}\nfor (const p of N.state.pending || []) addIntent({ fromEntity: p.fromEntity, fromType: p.fromType, fromPd: p.fromPd, toEntity: p.toEntity, toType: p.toType, toPd: p.toPd, fromPending: true });\nconst targetKnown = (ent, pd, type) => !!(maps[ent][pd] || foundId(type, pd) || (writtenInRun[ent] && writtenInRun[ent].has(pd)) || planned.some((x) => x.entity === ent && x.pdId === pd && x.action === 'SKIP_UNCHANGED'));\nconst fkUnresolved = intents.filter((i) => !targetKnown(i.toEntity, i.toPd, i.toType) || !targetKnown(i.fromEntity, i.fromPd, i.fromType)).map((i) => ({ from: `${i.fromEntity}:${i.fromPd}`, to: `${i.toEntity}:${i.toPd}` }));\n\n// ---- guards ------------------------------------------------------------------------------\nconst writes = planned.filter((r) => ['CREATE', 'UPDATE'].includes(r.action));\nconst considered = planned.filter((r) => r.action !== 'SKIP_ENTITY_DISABLED');\nconst quarantined = planned.filter((r) => r.action === 'QUARANTINE');\nconst quarantinePct = considered.length ? (quarantined.length / considered.length) * 100 : 0;\nconst guardFailures = [];\nif (writes.length > config.guards.maxWritesPerRun) guardFailures.push(`${writes.length} writes exceed MAX_WRITES_PER_RUN=${config.guards.maxWritesPerRun}`);\nif (quarantinePct > config.guards.maxQuarantinePct) guardFailures.push(`${quarantinePct.toFixed(1)}% of records quarantined exceeds MAX_QUARANTINE_PCT=${config.guards.maxQuarantinePct} (check STAGE_MAP_JSON / data quality)`);\n\n// ---- report --------------------------------------------------------------------------------\nconst byEntity = {};\nfor (const r of planned) {\n  const e = (byEntity[r.entity] = byEntity[r.entity] || { extracted: 0, CREATE: 0, UPDATE: 0, SKIP_UNCHANGED: 0, QUARANTINE: 0, SKIP_ENTITY_DISABLED: 0, warnings: 0 });\n  e.extracted++; e[r.action]++; e.warnings += r.issues.filter((i) => i.severity === 'warning').length;\n}\nconst issueCounts = {};\nfor (const r of planned) for (const i of r.issues) issueCounts[i.code] = (issueCounts[i.code] || 0) + 1;\nconst report = {\n  runId: config.runId,\n  generatedAt: config.now,\n  mode: config.sandboxMode ? 'SANDBOX' : config.dryRun ? 'DRY_RUN' : 'LIVE',\n  source: N.source,\n  entities: config.entities,\n  extractedSince: Object.fromEntries(Object.entries(N.requests).map(([k, v]) => [k, v.since])),\n  backlogRemaining: N.truncated,\n  summary: byEntity,\n  totals: { writes: writes.length, creates: writes.filter((r) => r.action === 'CREATE').length, updates: writes.filter((r) => r.action === 'UPDATE').length, unchanged: planned.filter((r) => r.action === 'SKIP_UNCHANGED').length, quarantined: quarantined.length, quarantinePct: quarantinePct.toFixed(1), associationsPlanned: intents.length, associationsUnresolved: fkUnresolved.length },\n  issueCounts,\n  quarantine: quarantined.slice(0, 500).map((r) => ({ entity: r.entity, pipedriveId: r.pdId, reasons: r.issues.filter((i) => i.severity === 'error').map((i) => `${i.code}: ${i.detail}`) })),\n  warnings: planned.filter((r) => r.issues.some((i) => i.severity === 'warning')).slice(0, 500).map((r) => ({ entity: r.entity, pipedriveId: r.pdId, action: r.action, warnings: r.issues.filter((i) => i.severity === 'warning').map((i) => i.code) })),\n  emailConflicts: planned.filter((r) => r.issues.some((i) => /^CONTACT_EMAIL_|^CONTACT_ADOPTED|DUPLICATE_EMAIL/.test(i.code))).map((r) => ({ pipedriveId: r.pdId, codes: r.issues.filter((i) => /EMAIL|ADOPTED/.test(i.code)).map((i) => i.code) })),\n  fkUnresolved: fkUnresolved.slice(0, 500),\n  plannedWrites: writes.slice(0, 1000).map((r) => ({ entity: r.entity, objectType: r.objectType, pipedriveId: r.pdId, action: r.action, hubspotId: r.existingId, mode: r.mode })),\n  proposedWatermarks: N.maxUpdateTime,\n  guards: { passed: guardFailures.length === 0, failures: guardFailures },\n  configWarnings: config.warnings,\n  configErrors: config.configErrors,\n  preflightLookups: pre.lookups,\n};\nconst writeBlockers = [...config.writes.blockers, ...guardFailures];\nif (!writes.length && !intents.length) writeBlockers.push('Nothing to migrate');\nreturn [{ json: { report, planned, intents, writeAllowed: writeBlockers.length === 0, writeBlockers } }];\n"
+      },
+      "id": "9345e204-a04f-473d-a3cc-351d03b8964b",
+      "name": "Migration Plan & Validation Report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3460,
+        100
+      ],
+      "notes": "CREATE / UPDATE / SKIP_UNCHANGED / QUARANTINE, email conflicts, FK plan, guards, dry-run report."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "b4b96024-c4e2-4a13-ae8f-c0aaa1a8539f",
+              "leftValue": "={{ $json.writeAllowed }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "56757344-47a4-40e3-a6d9-13fe7d1946a4",
+      "name": "Write Allowed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        3680,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Full text: DISCLAIMER.md · Licensed under the MIT License. License: MIT © 2026 dhRobin Systems · Provided as-is, see the disclaimer.\n// ============================================================================\n// Dry-Run Validation Report\n// Nothing was written and migration state is unchanged. The report lists\n// planned creates / updates, unchanged skips, quarantined records with reasons,\n// email conflicts, unresolved foreign keys and proposed watermarks.\n// ============================================================================\nconst P = $input.first().json;\nreturn [{ json: { mode: 'dry-run', writeBlockedBy: P.writeBlockers, report: P.report } }];\n"
+      },
+      "id": "099fd4cf-439b-4dcc-ad95-f6fcfd9c3b75",
+      "name": "Dry-Run Validation Report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3900,
+        340
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Full text: DISCLAIMER.md · Licensed under the MIT License. License: MIT © 2026 dhRobin Systems · Provided as-is, see the disclaimer.\n// ============================================================================\n// Build Upsert Batches\n// Writes in dependency order (companies, contacts, deals, then activities)\n// as HubSpot batch upserts keyed by the unique pipedrive_*_id property, so a\n// retried or repeated batch updates instead of duplicating. Adopted contacts\n// (CONTACT_EMAIL_CONFLICT_POLICY=adopt) use batch update by HubSpot id.\n// ============================================================================\nconst { config } = $('Config & Safety Gate').first().json;\nconst P = $input.first().json;\nconst H = config.hubspot;\nconst ORDER = ['companies', 'contacts', 'deals', 'calls', 'meetings', 'tasks'];\nconst writes = P.planned.filter((r) => ['CREATE', 'UPDATE'].includes(r.action));\nconst items = [];\nfor (const objectType of ORDER) {\n  for (const mode of ['upsert', 'update']) {\n    const group = writes.filter((r) => r.objectType === objectType && r.mode === mode);\n    for (let i = 0; i < group.length; i += H.batchSize) {\n      const chunk = group.slice(i, i + H.batchSize);\n      const inputs = mode === 'upsert'\n        ? chunk.map((r) => ({ idProperty: r.idProperty, id: r.pdId, properties: r.properties }))\n        : chunk.map((r) => ({ id: r.existingId, properties: r.properties }));\n      items.push({ json: { objectType, mode, entity: chunk[0].entity, pdIds: chunk.map((r) => r.pdId), hsIds: chunk.map((r) => r.existingId), url: `${H.base}/crm/v3/objects/${objectType}/batch/${mode}`, body: { inputs } } });\n    }\n  }\n}\nreturn items.length ? items : [{ json: { noop: true } }];\n"
+      },
+      "id": "bf8463cc-3b26-471d-ae76-2d3f4ea99cfc",
+      "name": "Build Upsert Batches",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3900,
+        -60
+      ],
+      "notes": "Batch upserts keyed by pipedrive_*_id (idempotent), dependency order."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "40efc66e-0a68-447b-ad6e-85751c7fe4e2",
+              "leftValue": "={{ $json.noop !== true }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "0102eed3-6ca6-4609-af41-f0a944d7d21d",
+      "name": "Upserts Needed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        4120,
+        -60
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_PRIVATE_APP_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.body) }}",
+        "options": {
+          "timeout": 60000,
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 150
+            }
+          }
+        }
+      },
+      "id": "31399945-12bc-4efc-a312-efcd2c262c91",
+      "name": "HubSpot: Batch Upsert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        4340,
+        -200
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "onError": "continueRegularOutput",
+      "notes": "Idempotent batch upsert / update. Retries are safe (upsert by unique property); failures are recorded per record."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Full text: DISCLAIMER.md · Licensed under the MIT License. License: MIT © 2026 dhRobin Systems · Provided as-is, see the disclaimer.\n// ============================================================================\n// Record Write Results\n// Maps each HubSpot batch response back to Pipedrive ids. A failed batch marks\n// every record in it as failed (the entity's watermark is then held back so the\n// next run retries; upserts make the retry safe). Partial (207) responses mark\n// only the records without a result as failed.\n// ============================================================================\nconst reqs = $('Build Upsert Batches').all().map((i) => i.json);\nconst res = $input.all().map((i) => i.json);\nconst written = { organizations: {}, persons: {}, deals: {}, activities: {} };\nconst failures = [];\nlet batches = 0;\nif (!(reqs.length === 1 && reqs[0].noop)) {\n  reqs.forEach((q, i) => {\n    batches++;\n    const r = res[i] || {};\n    if (r.error || !Array.isArray(r.results)) {\n      const msg = r.error ? String(r.error.message || r.error.description || r.error).slice(0, 300) : 'unexpected response';\n      for (const pd of q.pdIds) failures.push({ entity: q.entity, objectType: q.objectType, pipedriveId: pd, error: msg });\n      return;\n    }\n    const got = new Map();\n    q.pdIds.forEach((pd, k) => {\n      const idProp = q.body.inputs[k].idProperty;\n      const hit = q.mode === 'upsert'\n        ? r.results.find((x) => x.properties && String(x.properties[idProp]) === pd)\n        : r.results.find((x) => String(x.id) === String(q.hsIds[k]));\n      if (hit) got.set(pd, hit);\n    });\n    const errText = Array.isArray(r.errors) && r.errors.length ? r.errors.map((e) => e.message).join('; ').slice(0, 300) : 'no result returned for this record';\n    for (const pd of q.pdIds) {\n      const hit = got.get(pd);\n      if (hit) written[q.entity][pd] = { id: String(hit.id), objectType: q.objectType, created: hit.new === true };\n      else failures.push({ entity: q.entity, objectType: q.objectType, pipedriveId: pd, error: errText });\n    }\n  });\n}\nreturn [{ json: { written, failures, batches } }];\n"
+      },
+      "id": "6384be65-4cc7-4d87-a494-cb13e54f04b9",
+      "name": "Record Write Results",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4560,
+        -200
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Full text: DISCLAIMER.md · Licensed under the MIT License. License: MIT © 2026 dhRobin Systems · Provided as-is, see the disclaimer.\n// ============================================================================\n// Build Association Batches\n// Resolves every planned association through the ID mapping chain:\n//   this run's write results -> persisted mapping table -> preflight lookup.\n// Pairs whose endpoint is not in HubSpot yet (quarantined, failed, not yet\n// extracted) become PENDING and are retried automatically on later runs.\n// Uses the v4 default-association batch endpoint (idempotent).\n// ============================================================================\nconst { config } = $('Config & Safety Gate').first().json;\nconst P = $('Migration Plan & Validation Report').first().json;\nconst N = $('Normalize & Validate').first().json;\nconst pre = $('Collect Preflight Results').first().json;\nlet W = { written: { organizations: {}, persons: {}, deals: {}, activities: {} }, failures: [] };\ntry { W = $('Record Write Results').first().json; } catch (e) { /* no upserts this run */ }\nconst H = config.hubspot;\nconst idOf = (ent, pd, type) => {\n  const w = W.written[ent] && W.written[ent][pd];\n  if (w) return w.id;\n  const m = N.state.maps[ent][pd];\n  if (m) return String(m.id);\n  return (pre.found[type] || {})[pd] || null;\n};\nconst groups = {};\nconst pending = [];\nfor (const it of P.intents) {\n  const from = idOf(it.fromEntity, it.fromPd, it.fromType);\n  const to = idOf(it.toEntity, it.toPd, it.toType);\n  if (!from || !to) { pending.push({ ...it, reason: !from ? 'SOURCE_NOT_IN_HUBSPOT' : 'TARGET_NOT_IN_HUBSPOT' }); continue; }\n  const k = `${it.fromType}|${it.toType}`;\n  (groups[k] = groups[k] || []).push({ ...it, from, to });\n}\nconst items = [];\nif (config.writes.associationsEnabled) {\n  for (const [k, list] of Object.entries(groups)) {\n    const [fromType, toType] = k.split('|');\n    for (let i = 0; i < list.length; i += H.assocBatchSize) {\n      const chunk = list.slice(i, i + H.assocBatchSize);\n      items.push({ json: { fromType, toType, pairs: chunk, url: `${H.base}/crm/v4/associations/${fromType}/${toType}/batch/associate/default`, body: { inputs: chunk.map((p) => ({ from: { id: p.from }, to: { id: p.to } })) } } });\n    }\n  }\n}\nreturn items.length ? items.map((i) => ({ json: { ...i.json, pending } })) : [{ json: { noop: true, pending, disabled: !config.writes.associationsEnabled } }];\n"
+      },
+      "id": "8cf9b16a-fd26-4056-af0d-351b6e123450",
+      "name": "Build Association Batches",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4780,
+        -60
+      ],
+      "notes": "Resolves FK pairs through the mapping chain; unresolved pairs become pending."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "4c1e3626-e4ad-48f0-a2fd-b369c1df51ce",
+              "leftValue": "={{ $json.noop !== true }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "41e908c9-47a2-479b-ab27-ed59fd5baa5c",
+      "name": "Associations Needed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        5000,
+        -60
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_PRIVATE_APP_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.body) }}",
+        "options": {
+          "timeout": 60000,
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 150
+            }
+          }
+        }
+      },
+      "id": "d484e0c4-5e24-4a26-abf4-2d79bf9a797a",
+      "name": "HubSpot: Batch Associate",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        5220,
+        -200
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "onError": "continueRegularOutput",
+      "notes": "v4 default associations (idempotent)."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Full text: DISCLAIMER.md · Licensed under the MIT License. License: MIT © 2026 dhRobin Systems · Provided as-is, see the disclaimer.\n// ============================================================================\n// Record Association Results\n// Failed association batches go back to the pending queue for the next run.\n// ============================================================================\nconst reqs = $('Build Association Batches').all().map((i) => i.json);\nconst res = $input.all().map((i) => i.json);\nlet created = 0;\nconst failed = [];\nreqs.forEach((q, i) => {\n  const r = res[i] || {};\n  if (r.error || (r.status && r.status !== 'COMPLETE') || (Array.isArray(r.errors) && r.errors.length)) {\n    const msg = r.error ? String(r.error.message || r.error).slice(0, 200) : (r.errors || []).map((e) => e.message).join('; ').slice(0, 200) || 'association batch not complete';\n    for (const p of q.pairs) failed.push({ ...p, reason: 'ASSOCIATION_FAILED: ' + msg });\n  } else created += q.pairs.length;\n});\nreturn [{ json: { created, failed, pending: reqs[0] ? reqs[0].pending : [] } }];\n"
+      },
+      "id": "1ef4e5e0-bc8b-436b-a6d2-13e11a7e523d",
+      "name": "Record Association Results",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5440,
+        -200
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Full text: DISCLAIMER.md · Licensed under the MIT License. License: MIT © 2026 dhRobin Systems · Provided as-is, see the disclaimer.\n// ============================================================================\n// Commit Migration State\n// Updates the persisted ID mapping tables (Pipedrive id -> HubSpot id + content\n// hash), advances each entity's watermark only when that entity had zero write\n// failures, stores the pending-association queue and the quarantine registry,\n// and appends a run log entry. Persisted only for armed live runs.\n// ============================================================================\nconst { config } = $('Config & Safety Gate').first().json;\nconst N = $('Normalize & Validate').first().json;\nconst P = $('Migration Plan & Validation Report').first().json;\nlet W = { written: { organizations: {}, persons: {}, deals: {}, activities: {} }, failures: [], batches: 0 };\ntry { W = $('Record Write Results').first().json; } catch (e) { /* no upserts */ }\nconst AB = $('Build Association Batches').first().json;\nlet A = { created: 0, failed: [], pending: AB.pending || [] };\ntry { A = $('Record Association Results').first().json; } catch (e) { /* no association batches */ }\nconst state = JSON.parse(JSON.stringify(N.state));\n\nconst recByKey = new Map(P.planned.map((r) => [`${r.entity}:${r.pdId}`, r]));\nlet mapped = 0;\nfor (const [entity, recs] of Object.entries(W.written)) {\n  for (const [pd, w] of Object.entries(recs)) {\n    const r = recByKey.get(`${entity}:${pd}`);\n    state.maps[entity][pd] = entity === 'activities' ? { id: w.id, h: r ? r.hash : '', t: w.objectType } : { id: w.id, h: r ? r.hash : '' };\n    delete state.quarantine[`${entity}:${pd}`];\n    mapped++;\n  }\n}\nfor (const r of P.planned) if (r.action === 'QUARANTINE') state.quarantine[`${r.entity}:${r.pdId}`] = { codes: r.issues.filter((i) => i.severity === 'error').map((i) => i.code), at: config.now, updateTime: r.updateTime };\n\nconst failedEntities = new Set(W.failures.map((f) => f.entity));\nconst watermarkChanges = {};\nfor (const e of config.entities) {\n  const next = N.maxUpdateTime[e];\n  if (failedEntities.has(e)) { watermarkChanges[e] = { held: true, reason: 'write failures', value: state.watermarks[e] }; continue; }\n  if (next && (!state.watermarks[e] || next > state.watermarks[e])) { watermarkChanges[e] = { from: state.watermarks[e], to: next }; state.watermarks[e] = next; }\n}\n\nconst seen = new Set();\nconst pending = [];\nfor (const p of [...(A.failed || []), ...(A.pending || [])]) {\n  const k = `${p.fromType}|${p.fromPd}|${p.toType}|${p.toPd}`;\n  if (seen.has(k)) continue;\n  seen.add(k);\n  pending.push({ fromEntity: p.fromEntity, fromType: p.fromType, fromPd: p.fromPd, toEntity: p.toEntity, toType: p.toType, toPd: p.toPd, reason: p.reason, since: p.since || config.now });\n}\nlet droppedPending = 0;\nif (pending.length > config.guards.maxPendingAssociations) { droppedPending = pending.length - config.guards.maxPendingAssociations; pending.sort((a, b) => (a.since < b.since ? 1 : -1)); pending.length = config.guards.maxPendingAssociations; }\nstate.pending = pending;\n\nconst run = { runId: config.runId, at: config.now, writes: Object.values(W.written).reduce((s, m) => s + Object.keys(m).length, 0), failures: W.failures.length, associations: A.created, pending: pending.length, quarantined: P.report.totals.quarantined };\nstate.runs = [run, ...state.runs].slice(0, 30);\nstate.updatedAt = config.now;\n\nlet persisted = false;\nif (config.writes.allowedByConfig) {\n  const sd = $getWorkflowStaticData('global');\n  sd.migration = state;\n  persisted = true;\n}\nreturn [{ json: {\n  mode: 'migrated',\n  written: W.written,\n  failures: W.failures,\n  associationsCreated: A.created,\n  associationFailures: (A.failed || []).length,\n  pendingAssociations: pending.length,\n  droppedPending,\n  mappedRecords: mapped,\n  watermarkChanges,\n  persisted,\n  mapSizes: Object.fromEntries(Object.entries(state.maps).map(([k, v]) => [k, Object.keys(v).length])),\n} }];\n"
+      },
+      "id": "810c42e5-f43d-4f86-addf-3d73123ec1b2",
+      "name": "Commit Migration State",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5660,
+        -60
+      ],
+      "notes": "Mapping tables, watermarks (held on failure), pending queue, quarantine registry."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Full text: DISCLAIMER.md · Licensed under the MIT License. License: MIT © 2026 dhRobin Systems · Provided as-is, see the disclaimer.\n// ============================================================================\n// Migration Run Report\n// One summary item per execution. No tokens, no record contents.\n// ============================================================================\nconst { config, safetyDecisions } = $('Config & Safety Gate').first().json;\nconst P = $('Migration Plan & Validation Report').first().json;\nconst last = $input.first().json;\nlet status;\nif (last.mode === 'migrated') status = last.failures.length || last.associationFailures ? 'PARTIAL' : 'MIGRATED';\nelse if (P.report.guards.failures.length && config.writes.allowedByConfig) status = 'BLOCKED_BY_GUARD';\nelse if (P.writeBlockers.includes('Nothing to migrate')) status = 'NOTHING_TO_MIGRATE';\nelse status = config.sandboxMode ? 'SANDBOX_DRY_RUN' : 'DRY_RUN';\nreturn [{ json: {\n  runId: config.runId,\n  status,\n  mode: P.report.mode,\n  entities: config.entities,\n  totals: P.report.totals,\n  summary: P.report.summary,\n  issueCounts: P.report.issueCounts,\n  backlogRemaining: P.report.backlogRemaining,\n  writes: last.mode === 'migrated' ? { failures: last.failures, associationsCreated: last.associationsCreated, associationFailures: last.associationFailures, pendingAssociations: last.pendingAssociations, watermarkChanges: last.watermarkChanges, mapSizes: last.mapSizes, persisted: last.persisted } : null,\n  writeBlockedBy: last.mode === 'migrated' ? [] : P.writeBlockers,\n  warnings: config.warnings,\n  configErrors: config.configErrors,\n  safetyDecisions,\n} }];\n"
+      },
+      "id": "375ef11f-4f17-42a0-a260-2d15b99ab71f",
+      "name": "Migration Run Report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5880,
+        100
+      ]
+    }
+  ],
+  "connections": {
+    "Manual Test Trigger": {
+      "main": [
+        [
+          {
+            "node": "Config & Safety Gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Incremental Sync (hourly :17)": {
+      "main": [
+        [
+          {
+            "node": "Config & Safety Gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config & Safety Gate": {
+      "main": [
+        [
+          {
+            "node": "Sandbox Mode?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sandbox Mode?": {
+      "main": [
+        [
+          {
+            "node": "Load Synthetic Pipedrive Fixture",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Load Migration State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Synthetic Pipedrive Fixture": {
+      "main": [
+        [
+          {
+            "node": "Normalize & Validate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Migration State": {
+      "main": [
+        [
+          {
+            "node": "Pipedrive: Fetch Organizations",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pipedrive: Fetch Organizations": {
+      "main": [
+        [
+          {
+            "node": "Collect Organization Pages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Collect Organization Pages": {
+      "main": [
+        [
+          {
+            "node": "Pipedrive: Fetch Persons",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pipedrive: Fetch Persons": {
+      "main": [
+        [
+          {
+            "node": "Collect Person Pages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Collect Person Pages": {
+      "main": [
+        [
+          {
+            "node": "Pipedrive: Fetch Deals",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pipedrive: Fetch Deals": {
+      "main": [
+        [
+          {
+            "node": "Collect Deal Pages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Collect Deal Pages": {
+      "main": [
+        [
+          {
+            "node": "Pipedrive: Fetch Activities",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pipedrive: Fetch Activities": {
+      "main": [
+        [
+          {
+            "node": "Collect Activity Pages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Collect Activity Pages": {
+      "main": [
+        [
+          {
+            "node": "Normalize & Validate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize & Validate": {
+      "main": [
+        [
+          {
+            "node": "Build Preflight Lookups",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Preflight Lookups": {
+      "main": [
+        [
+          {
+            "node": "Lookups Needed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Lookups Needed?": {
+      "main": [
+        [
+          {
+            "node": "Sandbox Lookup?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Collect Preflight Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sandbox Lookup?": {
+      "main": [
+        [
+          {
+            "node": "Simulated HubSpot Lookup",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "HubSpot: Preflight Batch Read",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Simulated HubSpot Lookup": {
+      "main": [
+        [
+          {
+            "node": "Collect Preflight Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HubSpot: Preflight Batch Read": {
+      "main": [
+        [
+          {
+            "node": "Collect Preflight Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Collect Preflight Results": {
+      "main": [
+        [
+          {
+            "node": "Migration Plan & Validation Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Migration Plan & Validation Report": {
+      "main": [
+        [
+          {
+            "node": "Write Allowed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write Allowed?": {
+      "main": [
+        [
+          {
+            "node": "Build Upsert Batches",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Dry-Run Validation Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Upsert Batches": {
+      "main": [
+        [
+          {
+            "node": "Upserts Needed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upserts Needed?": {
+      "main": [
+        [
+          {
+            "node": "HubSpot: Batch Upsert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Association Batches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HubSpot: Batch Upsert": {
+      "main": [
+        [
+          {
+            "node": "Record Write Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record Write Results": {
+      "main": [
+        [
+          {
+            "node": "Build Association Batches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Association Batches": {
+      "main": [
+        [
+          {
+            "node": "Associations Needed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Associations Needed?": {
+      "main": [
+        [
+          {
+            "node": "HubSpot: Batch Associate",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Commit Migration State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HubSpot: Batch Associate": {
+      "main": [
+        [
+          {
+            "node": "Record Association Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record Association Results": {
+      "main": [
+        [
+          {
+            "node": "Commit Migration State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Commit Migration State": {
+      "main": [
+        [
+          {
+            "node": "Migration Run Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Dry-Run Validation Report": {
+      "main": [
+        [
+          {
+            "node": "Migration Run Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": true
+  }
+}
